@@ -7,7 +7,7 @@ BanditDB abstracts away the complex linear algebra of Reinforcement Learning (Li
 ## 📦 Installation
 
 ```bash
-pip install banditdb
+pip install -e .
 
 Note: You must have the BanditDB Rust Server running (default: http://localhost:8080).
 
