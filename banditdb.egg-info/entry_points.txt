@@ -1,0 +1,2 @@
+[console_scripts]
+banditdb-mcp = banditdb.mcp_server:main

@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: banditdb
+Version: 0.1.0
+Summary: Official Python SDK for BanditDB
+Author: BanditDB Team
+Requires-Python: >=3.8
+Requires-Dist: requests>=2.25.0
+Requires-Dist: urllib3>=1.26.0
+Requires-Dist: mcp>=0.1.0
