@@ -8,6 +8,7 @@ BanditDB abstracts away the complex linear algebra of Reinforcement Learning (Li
 
 ```bash
 pip install -e .
+```
 
 Note: You must have the BanditDB Rust Server running (default: http://localhost:8080).
 
@@ -59,6 +60,7 @@ Because you installed the banditdb package, you automatically have the MCP serve
 
 ```bash
 banditdb-mcp
+```
 
 Connecting Claude Desktop to BanditDB
 To give Claude persistent reinforcement-learning memory across all your chats, add BanditDB to your Claude configuration file:
