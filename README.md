@@ -1,116 +1,137 @@
-# BanditDB Python SDK 🚀
+# BanditDB Python SDK
 
 The official Python client and Model Context Protocol (MCP) server for **BanditDB** — the ultra-fast, lock-free Contextual Bandit database written in Rust.
 
-BanditDB abstracts away the complex linear algebra of Reinforcement Learning (LinUCB, Thompson Sampling) behind a dead-simple API. It allows developers to build real-time personalizers, dynamic A/B tests, and gives LLM Agents mathematically rigorous "persistent memory."
+BanditDB abstracts away the complex linear algebra of Reinforcement Learning (LinUCB, Thompson Sampling) behind a dead-simple API. Build real-time personalizers, dynamic A/B tests, and give LLM agents mathematically rigorous persistent memory.
 
-## 📦 Installation
+## Installation
 
 ```bash
-pip install -e .
+pip install banditdb-python
 ```
 
-Note: You must have the BanditDB Rust Server running (default: http://localhost:8080).
+Requires the BanditDB Rust server running (default: `http://localhost:8080`).
 
-💻 1. Standard SDK Usage (For Developers & Data Scientists)
-The Python client is production-ready, featuring automatic connection pooling, exponential backoff retries, and strict timeouts.
+---
 
-Quickstart
+## 1. Standard SDK Usage
+
+The client features automatic connection pooling, exponential backoff retries, and strict timeouts.
 
 ```python
 from banditdb import Client, BanditDBError
 
-# Connect to the BanditDB Rust backend
-db = Client(url="http://localhost:8080", timeout=2.0)
+# Connect to the BanditDB server.
+# Pass api_key if BANDITDB_API_KEY is set on the server.
+db = Client(
+    url="http://localhost:8080",
+    timeout=2.0,
+    api_key="your-secret-key",   # omit if server runs without auth
+)
 
 try:
-    # 1. Create a dynamic campaign (Cold Start)
-    # E.g., 3 features in our context vector, 2 possible actions
+    # 1. Create a campaign (run once at startup)
     db.create_campaign(
-        campaign_id="checkout_upsell", 
-        arms=["offer_discount", "offer_free_shipping"], 
-        feature_dim=3
+        campaign_id="checkout_upsell",
+        arms=["offer_discount", "offer_free_shipping"],
+        feature_dim=3,
     )
 
-    # 2. A user arrives! Ask the database what to show them.
-    # Context vector could be:[is_mobile, cart_value_normalized, is_returning_user]
-    user_context = [1.0, 0.8, 0.0]
-    
-    arm_id, interaction_id = db.predict("checkout_upsell", user_context)
-    print(f"Showing user: {arm_id}") # e.g., "offer_free_shipping"
+    # 2. A user arrives — ask the database what to show them
+    # Context: [is_mobile, cart_value_normalized, is_returning_user]
+    arm_id, interaction_id = db.predict("checkout_upsell", [1.0, 0.8, 0.0])
+    print(f"Showing: {arm_id}")  # e.g., "offer_free_shipping"
 
-    # ... User interacts with your app ...
-
-    # 3. The user clicked the offer! Send a reward of 1.0.
-    # The Sherman-Morrison matrices in Rust are instantly updated.
+    # 3. The user clicked — send the reward
     db.reward(interaction_id, reward=1.0)
-    print("Database mathematically updated.")
 
 except BanditDBError as e:
     print(f"Database error: {e}")
 ```
 
+### All Client methods
 
-🤖 2. The AI "Hive Mind" (Model Context Protocol)
+| Method | Description |
+|--------|-------------|
+| `health()` | Returns `True` if the server is reachable and healthy. |
+| `create_campaign(campaign_id, arms, feature_dim)` | Register a new campaign. |
+| `delete_campaign(campaign_id)` | Delete a campaign. Returns `False` if not found. |
+| `predict(campaign_id, context)` | Returns `(arm_id, interaction_id)`. |
+| `reward(interaction_id, reward)` | Close the feedback loop. Reward must be in `[0, 1]`. |
+| `export()` | Trigger a Parquet export of the WAL. Returns the server confirmation message. |
 
-Standard LLMs (like Claude or GPT-4) are amnesiacs. If they try a tool and fail, they might try the exact same failing strategy in a new chat tomorrow.
-BanditDB includes a built-in MCP Server that acts as a shared mathematical "Intuition Engine" for AI agents.
-Starting the MCP Server
-Because you installed the banditdb package, you automatically have the MCP server installed globally as a command-line tool. You can test it by running:
+---
+
+## 2. The AI "Hive Mind" (Model Context Protocol)
+
+Standard LLM agents are stateless — if they route a task to the wrong model and fail, they repeat the same mistake tomorrow. BanditDB's built-in MCP server gives the entire agent swarm shared persistent memory.
+
+### Starting the MCP server
 
 ```bash
+# Set environment variables before starting
+export BANDITDB_URL=http://localhost:8080
+export BANDITDB_API_KEY=your-secret-key   # omit if server runs without auth
+
 banditdb-mcp
 ```
 
-Connecting Claude Desktop to BanditDB
-To give Claude persistent reinforcement-learning memory across all your chats, add BanditDB to your Claude configuration file:
+### Connecting to Claude Desktop
 
-Mac: ~/Library/Application Support/Claude/claude_desktop_config.json
-Windows: %APPDATA%\Claude\claude_desktop_config.json
+Add to your Claude configuration file:
 
-```JSON
+- Mac: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
 {
   "mcpServers": {
     "banditdb": {
       "command": "banditdb-mcp",
-      "args":[]
+      "args": [],
+      "env": {
+        "BANDITDB_URL": "http://localhost:8080",
+        "BANDITDB_API_KEY": "your-secret-key"
+      }
     }
   }
 }
 ```
 
-Restart Claude. You can now prompt Claude with:
+The agent swarm now has two tools: `get_intuition` and `record_outcome`. Every decision made by any agent in the network improves the routing for all future agents.
 
-"I need to parse a massive JSON file. Can you ask BanditDB whether I should use jq or python? My context vector is [file_size_gb, has_nested_arrays]."
+---
 
-Claude will consult the database, take the action, and record the outcome (reward) automatically, optimizing itself for the next time you ask!
+## 3. Data Science & Offline Evaluation
 
-📊 3. Data Science & Offline Evaluation
-BanditDB uses Event Sourcing. Every prediction and reward is asynchronously written to a Write-Ahead Log (WAL). You can export this log into heavily compressed Apache Parquet format via the Rust API for offline model training using Polars or Pandas.
-
+BanditDB event-sources every prediction and reward to a Write-Ahead Log (WAL). Export it to Apache Parquet for offline analysis with Polars or Pandas.
 
 ```python
+# Trigger the export
+message = db.export()
+print(message)  # "Successfully exported N rows to bandit_logs_latest.parquet"
+
+# Load into Polars for Offline Policy Evaluation
 import polars as pl
-import requests
-
-# Trigger the Rust backend to compile the Parquet data lake
-requests.get("http://localhost:8080/export")
-
-# Load the exact historical DNA of your database
 df = pl.read_parquet("bandit_logs_latest.parquet")
-
-# View all predictions and propensity scores for Offline Policy Evaluation (OPE)
 predictions = df.select(pl.col("Predicted")).unnest("Predicted").drop_nulls()
 print(predictions.head())
 ```
 
-🛠️ Error Handling
-The SDK exposes specific exceptions for robust error handling in production:
-- BanditDBError: Base exception.
-- ConnectionError: The Rust server is offline or unreachable.
-- TimeoutError: The database took too long to respond (protects your app from hanging).
-- APIError: The database returned an error (e.g., Campaign Not Found).
+---
 
-License
-MIT License.
+## Error Handling
 
+| Exception | When raised |
+|-----------|-------------|
+| `BanditDBError` | Base exception — catch this to handle all SDK errors. |
+| `ConnectionError` | Server is offline or unreachable. |
+| `TimeoutError` | Request exceeded the configured timeout. |
+| `APIError` | Server returned an error (e.g., campaign not found, unauthorized). |
+
+---
+
+## License
+
+AGPL-3.0 — Copyright (C) 2026 Simeon Lukov.
+See the [main repository](https://github.com/simeonlukov/banditdb) for details.

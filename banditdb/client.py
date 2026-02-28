@@ -1,5 +1,5 @@
 import logging
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -10,22 +10,75 @@ logger = logging.getLogger(__name__)
 
 class Client:
     """Production-ready synchronous client for BanditDB."""
-    
-    def __init__(self, url: str = "http://localhost:8080", timeout: float = 2.0, max_retries: int = 3):
+
+    def __init__(
+        self,
+        url: str = "http://localhost:8080",
+        timeout: float = 2.0,
+        max_retries: int = 3,
+        api_key: Optional[str] = None,
+    ):
         self.url = url.rstrip("/")
         self.timeout = timeout
-        
+
         # Configure robust connection pooling and automatic retries
         self.session = requests.Session()
         retries = Retry(
             total=max_retries,
             backoff_factor=0.1,  # 0.1s, 0.2s, 0.4s between retries
-            status_forcelist=[500, 502, 503, 504], # Retry on server errors
-            allowed_methods=["POST"]
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["POST", "DELETE", "GET"],
         )
         adapter = HTTPAdapter(max_retries=retries, pool_connections=100, pool_maxsize=100)
-        self.session.mount('http://', adapter)
-        self.session.mount('https://', adapter)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+        # Set the API key header once on the session so every request carries it
+        if api_key:
+            self.session.headers.update({"X-Api-Key": api_key})
+
+    def health(self) -> bool:
+        """Return True if the server is reachable and healthy."""
+        try:
+            response = self.session.get(f"{self.url}/health", timeout=self.timeout)
+            return response.status_code == 200
+        except requests.exceptions.Timeout:
+            raise TimeoutError(f"BanditDB health check timed out after {self.timeout}s")
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError(f"Failed to connect to BanditDB at {self.url}")
+
+    def create_campaign(self, campaign_id: str, arms: List[str], feature_dim: int) -> bool:
+        """Create a new Multi-Armed Bandit campaign."""
+        try:
+            response = self.session.post(
+                f"{self.url}/campaign",
+                json={"campaign_id": campaign_id, "arms": arms, "feature_dim": feature_dim},
+                timeout=self.timeout,
+            )
+            if response.status_code != 200:
+                raise APIError(f"BanditDB Error: {response.text}")
+            return response.json() == "Campaign Created"
+        except requests.exceptions.Timeout:
+            raise TimeoutError("BanditDB request timed out.")
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError("Failed to connect to BanditDB")
+
+    def delete_campaign(self, campaign_id: str) -> bool:
+        """Delete a campaign. Returns True if deleted, False if not found."""
+        try:
+            response = self.session.delete(
+                f"{self.url}/campaign/{campaign_id}",
+                timeout=self.timeout,
+            )
+            if response.status_code == 404:
+                return False
+            if response.status_code != 200:
+                raise APIError(f"BanditDB Error: {response.text}")
+            return True
+        except requests.exceptions.Timeout:
+            raise TimeoutError(f"BanditDB request timed out after {self.timeout}s")
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError("Failed to connect to BanditDB")
 
     def predict(self, campaign_id: str, context: List[float]) -> Tuple[str, str]:
         """
@@ -36,15 +89,12 @@ class Client:
             response = self.session.post(
                 f"{self.url}/predict",
                 json={"campaign_id": campaign_id, "context": context},
-                timeout=self.timeout
+                timeout=self.timeout,
             )
-            
             if response.status_code != 200:
                 raise APIError(f"BanditDB Error: {response.text}")
-                
             data = response.json()
             return data["arm_id"], data["interaction_id"]
-            
         except requests.exceptions.Timeout:
             raise TimeoutError(f"BanditDB request timed out after {self.timeout}s")
         except requests.exceptions.ConnectionError:
@@ -59,36 +109,27 @@ class Client:
             response = self.session.post(
                 f"{self.url}/reward",
                 json={"interaction_id": interaction_id, "reward": reward},
-                timeout=self.timeout
+                timeout=self.timeout,
             )
-            
             if response.status_code != 200:
                 raise APIError(f"BanditDB Error: {response.text}")
-                
             return response.json() == "OK"
-            
         except requests.exceptions.Timeout:
             raise TimeoutError(f"BanditDB reward timed out after {self.timeout}s")
         except requests.exceptions.ConnectionError:
             raise ConnectionError("Failed to connect to BanditDB")
-            
-    def create_campaign(self, campaign_id: str, arms: List[str], feature_dim: int) -> bool:
-        """Create a new Multi-Armed Bandit campaign dynamically."""
+
+    def export(self) -> str:
+        """
+        Trigger a Parquet export of the WAL on the server.
+        Returns the server's confirmation message with the output path.
+        """
         try:
-            response = self.session.post(
-                f"{self.url}/campaign",
-                json={
-                    "campaign_id": campaign_id,
-                    "arms": arms,
-                    "feature_dim": feature_dim
-                },
-                timeout=self.timeout
-            )
+            response = self.session.get(f"{self.url}/export", timeout=self.timeout)
             if response.status_code != 200:
                 raise APIError(f"BanditDB Error: {response.text}")
-            return response.json() == "Campaign Created"
-            
+            return response.json()
         except requests.exceptions.Timeout:
-            raise TimeoutError("BanditDB request timed out.")
+            raise TimeoutError(f"BanditDB export timed out after {self.timeout}s")
         except requests.exceptions.ConnectionError:
             raise ConnectionError("Failed to connect to BanditDB")
