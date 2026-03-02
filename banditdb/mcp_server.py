@@ -166,7 +166,7 @@ def record_outcome(interaction_id: str, reward: float) -> str:
 
 def main():
     """Entry point for the command-line interface."""
-    print("🚀 Starting BanditDB MCP Server...", flush=True)
+    #print("🚀 Starting BanditDB MCP Server...", flush=True)
     mcp.run()
 
 if __name__ == "__main__":
