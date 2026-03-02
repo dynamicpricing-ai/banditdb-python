@@ -101,7 +101,17 @@ Add to your Claude configuration file:
 }
 ```
 
-The agent swarm now has two tools: `get_intuition` and `record_outcome`. Every decision made by any agent in the network improves the routing for all future agents.
+The agent swarm now has five tools:
+
+| Tool | What it does |
+|------|--------------|
+| `create_campaign` | Create a new decision campaign with a list of arms and a context dimension. |
+| `list_campaigns` | List all active campaigns — useful to check what exists before calling `get_intuition`. |
+| `campaign_diagnostics` | Inspect per-arm learning state: `theta_norm`, prediction counts, reward rates. Use this when a campaign doesn't seem to be learning. |
+| `get_intuition` | Ask BanditDB which arm to pick for a given context. Returns the arm and an `interaction_id` to save. |
+| `record_outcome` | Report whether the chosen action succeeded (1.0) or failed (0.0). Updates the shared model. |
+
+Every decision made by any agent in the network improves the routing for all future agents.
 
 ---
 
