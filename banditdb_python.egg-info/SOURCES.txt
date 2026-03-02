@@ -1,0 +1,14 @@
+LICENSE
+README.md
+pyproject.toml
+banditdb/__init__.py
+banditdb/client.py
+banditdb/exceptions.py
+banditdb/mcp_server.py
+banditdb_python.egg-info/PKG-INFO
+banditdb_python.egg-info/SOURCES.txt
+banditdb_python.egg-info/dependency_links.txt
+banditdb_python.egg-info/entry_points.txt
+banditdb_python.egg-info/requires.txt
+banditdb_python.egg-info/top_level.txt
+tests/test_client.py

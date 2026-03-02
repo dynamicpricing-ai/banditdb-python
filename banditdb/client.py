@@ -1,6 +1,6 @@
 import logging
-from typing import List, Optional, Tuple
 import requests
+from typing import List, Optional, Tuple
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -47,12 +47,30 @@ class Client:
         except requests.exceptions.ConnectionError:
             raise ConnectionError(f"Failed to connect to BanditDB at {self.url}")
 
-    def create_campaign(self, campaign_id: str, arms: List[str], feature_dim: int) -> bool:
-        """Create a new Multi-Armed Bandit campaign."""
+    def create_campaign(
+        self,
+        campaign_id: str,
+        arms: List[str],
+        feature_dim: int,
+        alpha: float = 1.0,
+    ) -> bool:
+        """
+        Create a new Multi-Armed Bandit campaign.
+
+        alpha controls the exploration/exploitation trade-off (LinUCB coefficient).
+        Lower values (e.g. 0.1) exploit learned knowledge more aggressively.
+        Higher values (e.g. 3.0) keep exploring uncertain arms longer.
+        Defaults to 1.0.
+        """
         try:
             response = self.session.post(
                 f"{self.url}/campaign",
-                json={"campaign_id": campaign_id, "arms": arms, "feature_dim": feature_dim},
+                json={
+                    "campaign_id": campaign_id,
+                    "arms": arms,
+                    "feature_dim": feature_dim,
+                    "alpha": alpha,
+                },
                 timeout=self.timeout,
             )
             if response.status_code != 200:
@@ -60,6 +78,43 @@ class Client:
             return response.json() == "Campaign Created"
         except requests.exceptions.Timeout:
             raise TimeoutError("BanditDB request timed out.")
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError("Failed to connect to BanditDB")
+
+    def list_campaigns(self) -> List[dict]:
+        """
+        List all live campaigns.
+        Returns a list of dicts with keys: campaign_id, alpha, arm_count.
+        """
+        try:
+            response = self.session.get(f"{self.url}/campaigns", timeout=self.timeout)
+            if response.status_code != 200:
+                raise APIError(f"BanditDB Error: {response.text}")
+            return response.json()
+        except requests.exceptions.Timeout:
+            raise TimeoutError(f"BanditDB request timed out after {self.timeout}s")
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError("Failed to connect to BanditDB")
+
+    def campaign_info(self, campaign_id: str) -> dict:
+        """
+        Return the full diagnostic state for one campaign.
+
+        The returned dict contains:
+          campaign_id, alpha, total_predictions, total_rewards,
+          arms: { arm_id: { theta, theta_norm, prediction_count, reward_count } }
+
+        Raises APIError (404) if the campaign does not exist.
+        """
+        try:
+            response = self.session.get(
+                f"{self.url}/campaign/{campaign_id}", timeout=self.timeout
+            )
+            if response.status_code != 200:
+                raise APIError(f"BanditDB Error: {response.text}")
+            return response.json()
+        except requests.exceptions.Timeout:
+            raise TimeoutError(f"BanditDB request timed out after {self.timeout}s")
         except requests.exceptions.ConnectionError:
             raise ConnectionError("Failed to connect to BanditDB")
 
@@ -119,10 +174,32 @@ class Client:
         except requests.exceptions.ConnectionError:
             raise ConnectionError("Failed to connect to BanditDB")
 
+    def checkpoint(self) -> str:
+        """
+        Flush the WAL, snapshot all campaign matrices, write completed
+        prediction→reward pairs to per-campaign Parquet files, and rotate
+        the WAL. Returns a summary string from the server.
+
+        Call this on a schedule or after significant traffic to keep the
+        WAL small and the Parquet export up to date.
+        """
+        try:
+            response = self.session.post(f"{self.url}/checkpoint", timeout=self.timeout)
+            if response.status_code != 200:
+                raise APIError(f"BanditDB Error: {response.text}")
+            return response.json()
+        except requests.exceptions.Timeout:
+            raise TimeoutError(f"BanditDB checkpoint timed out after {self.timeout}s")
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError("Failed to connect to BanditDB")
+
     def export(self) -> str:
         """
-        Trigger a Parquet export of the WAL on the server.
-        Returns the server's confirmation message with the output path.
+        List the per-campaign Parquet files available in the server's exports
+        directory. Files are created by checkpoint().
+
+        Returns a formatted string, e.g.:
+          'Parquet files in /data/exports: ["llm_routing.parquet"]'
         """
         try:
             response = self.session.get(f"{self.url}/export", timeout=self.timeout)

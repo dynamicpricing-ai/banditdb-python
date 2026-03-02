@@ -54,11 +54,14 @@ except BanditDBError as e:
 | Method | Description |
 |--------|-------------|
 | `health()` | Returns `True` if the server is reachable and healthy. |
-| `create_campaign(campaign_id, arms, feature_dim)` | Register a new campaign. |
+| `list_campaigns()` | Returns a list of all live campaigns with their `alpha` and `arm_count`. |
+| `campaign_info(campaign_id)` | Returns the full diagnostic state for one campaign: per-arm `theta`, `theta_norm`, `prediction_count`, `reward_count`, and totals. Raises `APIError` (404) if not found. |
+| `create_campaign(campaign_id, arms, feature_dim, alpha=1.0)` | Register a new campaign. `alpha` controls exploration (higher = more exploration). |
 | `delete_campaign(campaign_id)` | Delete a campaign. Returns `False` if not found. |
 | `predict(campaign_id, context)` | Returns `(arm_id, interaction_id)`. |
 | `reward(interaction_id, reward)` | Close the feedback loop. Reward must be in `[0, 1]`. |
-| `export()` | Trigger a Parquet export of the WAL. Returns the server confirmation message. |
+| `checkpoint()` | Flush the WAL, snapshot models, write Parquet files, rotate the WAL. Returns a summary string. |
+| `export()` | List per-campaign Parquet files created by `checkpoint()`. Returns a formatted string. |
 
 ---
 
@@ -104,18 +107,28 @@ The agent swarm now has two tools: `get_intuition` and `record_outcome`. Every d
 
 ## 3. Data Science & Offline Evaluation
 
-BanditDB event-sources every prediction and reward to a Write-Ahead Log (WAL). Export it to Apache Parquet for offline analysis with Polars or Pandas.
+BanditDB event-sources every prediction and reward to a Write-Ahead Log (WAL). Calling `checkpoint()` compiles completed prediction→reward pairs into Snappy-compressed Parquet files — one per campaign — for offline analysis with Polars or Pandas.
+
+Every prediction is guaranteed to appear in the Parquet file even if its reward arrives hours later: BanditDB re-emits in-flight interactions at each checkpoint so delayed rewards are always captured in a future cycle.
 
 ```python
-# Trigger the export
-message = db.export()
-print(message)  # "Successfully exported N rows to bandit_logs_latest.parquet"
+# Checkpoint: snapshot models, write Parquet, rotate the WAL.
+# Call this on a schedule or after significant traffic.
+summary = db.checkpoint()
+print(summary)
+# "Checkpoint written and WAL rotated: 2 campaigns, offset 4821 bytes,
+#  150 interactions exported, 3 in-flight re-emitted"
 
-# Load into Polars for Offline Policy Evaluation
+# List which Parquet files are available
+print(db.export())
+# 'Parquet files in /data/exports: ["llm_routing.parquet"]'
+
+# Load directly from the mounted volume into Polars for Offline Policy Evaluation.
+# Flat schema: interaction_id | arm_id | reward | predicted_at | rewarded_at | feature_0 | ...
 import polars as pl
-df = pl.read_parquet("bandit_logs_latest.parquet")
-predictions = df.select(pl.col("Predicted")).unnest("Predicted").drop_nulls()
-print(predictions.head())
+df = pl.read_parquet("/data/exports/llm_routing.parquet")
+print(df.head())
+print(df.columns)
 ```
 
 ---
