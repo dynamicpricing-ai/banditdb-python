@@ -20,6 +20,7 @@ def create_campaign(
     arms: list[str],
     feature_dim: int,
     alpha: float = 1.0,
+    algorithm: str = "linucb",
 ) -> str:
     """
     Create a new decision campaign in BanditDB.
@@ -37,17 +38,21 @@ def create_campaign(
                      to get_intuition. Must match exactly every time.
         alpha: Exploration coefficient (default 1.0). Lower values (e.g. 0.1)
                exploit learned knowledge faster. Higher values (e.g. 3.0) keep
-               exploring uncertain arms longer. Use the default unless you have
-               a specific reason to change it.
+               exploring uncertain arms longer.
+        algorithm: Decision algorithm — "linucb" (default) or "thompson_sampling".
+                   Use "thompson_sampling" for natural Bayesian exploration: no
+                   alpha sweep needed, and concurrent users automatically diversify
+                   arm coverage. Use "linucb" when you want deterministic,
+                   predictable exploration you can tune via alpha.
 
     Returns:
         Confirmation that the campaign was created, or an error message.
     """
     try:
-        db.create_campaign(campaign_id, arms, feature_dim, alpha=alpha)
+        db.create_campaign(campaign_id, arms, feature_dim, alpha=alpha, algorithm=algorithm)
         return (
             f"✅ Campaign '{campaign_id}' created with {len(arms)} arms: {arms}. "
-            f"feature_dim={feature_dim}, alpha={alpha}. "
+            f"feature_dim={feature_dim}, alpha={alpha}, algorithm={algorithm}. "
             f"You can now call get_intuition('{campaign_id}', context) with a "
             f"context vector of {feature_dim} floats."
         )
@@ -74,7 +79,8 @@ def list_campaigns() -> str:
         lines = [f"Active campaigns ({len(campaigns)}):"]
         for c in campaigns:
             lines.append(
-                f"  • {c['campaign_id']} — {c['arm_count']} arms, alpha={c['alpha']}"
+                f"  • {c['campaign_id']} — {c['arm_count']} arms, "
+                f"alpha={c['alpha']}, algorithm={c.get('algorithm', 'linucb')}"
             )
         return "\n".join(lines)
     except BanditDBError as e:
@@ -101,7 +107,8 @@ def campaign_diagnostics(campaign_id: str) -> str:
     try:
         info = db.campaign_info(campaign_id)
         lines = [
-            f"Campaign: {info['campaign_id']} (alpha={info['alpha']})",
+            f"Campaign: {info['campaign_id']} "
+            f"(algorithm={info.get('algorithm', 'linucb')}, alpha={info['alpha']})",
             f"Totals: {info['total_predictions']} predictions, "
             f"{info['total_rewards']} rewards",
             "",

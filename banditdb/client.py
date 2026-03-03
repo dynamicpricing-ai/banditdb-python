@@ -1,6 +1,6 @@
 import logging
 import requests
-from typing import List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -53,14 +53,21 @@ class Client:
         arms: List[str],
         feature_dim: int,
         alpha: float = 1.0,
+        algorithm: Literal["linucb", "thompson_sampling"] = "linucb",
     ) -> bool:
         """
         Create a new Multi-Armed Bandit campaign.
 
-        alpha controls the exploration/exploitation trade-off (LinUCB coefficient).
+        alpha controls the exploration/exploitation trade-off.
         Lower values (e.g. 0.1) exploit learned knowledge more aggressively.
         Higher values (e.g. 3.0) keep exploring uncertain arms longer.
         Defaults to 1.0.
+
+        algorithm selects the decision algorithm:
+          "linucb" (default) — deterministic UCB bonus; tune alpha to control exploration.
+          "thompson_sampling" — samples from the Bayesian posterior N(θ, alpha²·A⁻¹);
+            alpha=1.0 is the principled default (natural posterior width). Concurrent
+            users automatically diversify arm coverage with no alpha sweep needed.
         """
         try:
             response = self.session.post(
@@ -70,6 +77,7 @@ class Client:
                     "arms": arms,
                     "feature_dim": feature_dim,
                     "alpha": alpha,
+                    "algorithm": algorithm,
                 },
                 timeout=self.timeout,
             )

@@ -31,11 +31,13 @@ db = Client(
 
 try:
     # 1. Create a campaign (run once at startup)
+    # algorithm defaults to "linucb"; use "thompson_sampling" for Bayesian exploration
     db.create_campaign(
         campaign_id="checkout_upsell",
         arms=["offer_discount", "offer_free_shipping"],
         feature_dim=3,
     )
+    # or: db.create_campaign(..., algorithm="thompson_sampling")
 
     # 2. A user arrives — ask the database what to show them
     # Context: [is_mobile, cart_value_normalized, is_returning_user]
@@ -56,7 +58,7 @@ except BanditDBError as e:
 | `health()` | Returns `True` if the server is reachable and healthy. |
 | `list_campaigns()` | Returns a list of all live campaigns with their `alpha` and `arm_count`. |
 | `campaign_info(campaign_id)` | Returns the full diagnostic state for one campaign: per-arm `theta`, `theta_norm`, `prediction_count`, `reward_count`, and totals. Raises `APIError` (404) if not found. |
-| `create_campaign(campaign_id, arms, feature_dim, alpha=1.0)` | Register a new campaign. `alpha` controls exploration (higher = more exploration). |
+| `create_campaign(campaign_id, arms, feature_dim, alpha=1.0, algorithm="linucb")` | Register a new campaign. `algorithm` is `"linucb"` (default) or `"thompson_sampling"`. `alpha` controls exploration for both — for TS it sets the posterior width; `1.0` is the principled default. |
 | `delete_campaign(campaign_id)` | Delete a campaign. Returns `False` if not found. |
 | `predict(campaign_id, context)` | Returns `(arm_id, interaction_id)`. |
 | `reward(interaction_id, reward)` | Close the feedback loop. Reward must be in `[0, 1]`. |
@@ -105,8 +107,8 @@ The agent swarm now has five tools:
 
 | Tool | What it does |
 |------|--------------|
-| `create_campaign` | Create a new decision campaign with a list of arms and a context dimension. |
-| `list_campaigns` | List all active campaigns — useful to check what exists before calling `get_intuition`. |
+| `create_campaign` | Create a new decision campaign. Accepts `algorithm` (`"linucb"` or `"thompson_sampling"`) and `alpha`. Use Thompson Sampling for natural Bayesian exploration with no tuning needed. |
+| `list_campaigns` | List all active campaigns (shows `algorithm` and `alpha`) — useful to check what exists before calling `get_intuition`. |
 | `campaign_diagnostics` | Inspect per-arm learning state: `theta_norm`, prediction counts, reward rates. Use this when a campaign doesn't seem to be learning. |
 | `get_intuition` | Ask BanditDB which arm to pick for a given context. Returns the arm and an `interaction_id` to save. |
 | `record_outcome` | Report whether the chosen action succeeded (1.0) or failed (0.0). Updates the shared model. |
@@ -140,6 +142,28 @@ df = pl.read_parquet("/data/exports/llm_routing.parquet")
 print(df.head())
 print(df.columns)
 ```
+
+---
+
+## Choosing an Algorithm
+
+BanditDB supports two contextual bandit algorithms, selected at campaign creation time.
+
+| Algorithm | `algorithm` value | Exploration style | When to use |
+|-----------|------------------|-------------------|-------------|
+| **LinUCB** | `"linucb"` (default) | Deterministic UCB bonus: `θ·x + α√(x·A⁻¹·x)` | Predictable, tunable. Sweep `alpha` offline to calibrate. |
+| **Linear Thompson Sampling** | `"thompson_sampling"` | Samples θ̃ ~ N(θ, α²·A⁻¹), scores by θ̃·x | Bayesian posterior — no alpha-sweep needed. `alpha=1.0` is the natural posterior width. Concurrent users automatically diversify choices. |
+
+```python
+# LinUCB (default) — tune alpha to control how long it keeps exploring
+db.create_campaign("routing", ["fast", "cheap"], feature_dim=4, alpha=1.5)
+
+# Thompson Sampling — natural Bayesian exploration, alpha=1.0 is ideal
+db.create_campaign("routing_ts", ["fast", "cheap"], feature_dim=4,
+                   algorithm="thompson_sampling")
+```
+
+Both algorithms share identical state (A⁻¹, b, θ per arm), so the `predict` → `reward` loop is the same regardless of which you choose.
 
 ---
 
