@@ -25,9 +25,15 @@ license = "AGPL-3.0-or-later"
 license-files = ["LICEN[CS]E*"]
 
 [project.optional-dependencies]
+eval = [
+    "polars>=0.20.0",
+    "numpy>=1.24.0",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
+    "polars>=0.20.0",
+    "numpy>=1.24.0",
 ]
 
 [project.scripts]
