@@ -135,13 +135,60 @@ print(summary)
 print(db.export())
 # 'Parquet files in /data/exports: ["llm_routing.parquet"]'
 
-# Load directly from the mounted volume into Polars for Offline Policy Evaluation.
-# Flat schema: interaction_id | arm_id | reward | predicted_at | rewarded_at | feature_0 | ...
+# Load directly from the mounted volume into Polars.
+# Flat schema: interaction_id | arm_id | reward | predicted_at | rewarded_at | propensity | feature_0 | ...
 import polars as pl
 df = pl.read_parquet("/data/exports/llm_routing.parquet")
 print(df.head())
 print(df.columns)
 ```
+
+### Offline Policy Evaluation (OPE)
+
+The SDK ships three OPE estimators in `banditdb.eval`. They answer the question: *"what would my average reward have been under a different policy — without running a live experiment?"*
+
+Install the eval dependencies:
+
+```bash
+pip install "banditdb-python[eval]"
+```
+
+| Estimator | Function | How it works | When to use |
+|-----------|----------|-------------|-------------|
+| **Replay** | `replay(df)` | Accepts each interaction with probability `(1/K) / propensity` (Li et al. 2010). Unbiased sample of the uniform random policy. | Sanity check baseline. Low coverage is expected — ~1/K of interactions are used. |
+| **IPS / SNIPS** | `ips(df, clip=10.0)` | Uses every interaction with importance weight `(1/K) / propensity`. Self-normalised to reduce variance. Weight clipping (default 10×) controls the bias-variance tradeoff. | Primary estimator. Use when you have enough data but want full coverage. |
+| **Doubly Robust** | `doubly_robust(df, clip=10.0)` | Fits a linear reward model, then applies an IPS correction on residuals. Consistent if either the reward model or the propensities are correct. | Best statistical efficiency. Use when comparing multiple policies or sweeping `alpha`. |
+
+All three estimators:
+- Accept a Polars or pandas DataFrame loaded from a BanditDB Parquet export
+- Evaluate the **uniform random policy** as the target (the unbiased baseline to beat)
+- Raise `ValueError` for Thompson Sampling campaigns (propensity column is null — TS does not log propensities)
+- Return an `OPEResult` with `estimate`, `std_error`, `n_used`, `n_total`, and `method`
+
+```python
+import polars as pl
+from banditdb.eval import replay, ips, doubly_robust
+
+df = pl.read_parquet("/data/exports/llm_routing.parquet")
+
+# How much reward would a uniform random policy have earned?
+print(replay(df))
+# OPEResult(method='replay', estimate=0.4821, std_error=0.0312, coverage=22.1% [33/149])
+
+print(ips(df))
+# OPEResult(method='ips', estimate=0.5103, std_error=0.0187, coverage=100.0% [149/149])
+
+print(doubly_robust(df))
+# OPEResult(method='doubly_robust', estimate=0.5219, std_error=0.0141, coverage=100.0% [149/149])
+
+# Compare against the observed reward of the logging policy:
+print("Observed (logging policy):", df["reward"].mean())
+# If observed >> estimate, the campaign has learned something real — it outperforms random.
+```
+
+**Practical use: sweep `alpha` offline before deploying.** Train a campaign on real traffic, checkpoint to Parquet, then replay different alpha values through `doubly_robust()` to find the best exploration level — no live experiment needed.
+
+> **Note:** OPE requires the `propensity` column, which is only written for **LinUCB** campaigns. Thompson Sampling campaigns log `null` propensities because TS arm selection is stochastic and propensity scoring requires a deterministic logging policy.
 
 ---
 
@@ -180,5 +227,5 @@ Both algorithms share identical state (A⁻¹, b, θ per arm), so the `predict` 
 
 ## License
 
-AGPL-3.0 — Copyright (C) 2026 Simeon Lukov.
-See the [main repository](https://github.com/simeonlukov/banditdb) for details.
+Apache-2.0 — Copyright (C) 2026 Simeon Lukov and Dynamic Pricing Ltd.
+See the [main repository](https://github.com/dynamicpricing-ai/banditdb) for details.
