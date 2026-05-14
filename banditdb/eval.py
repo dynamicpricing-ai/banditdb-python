@@ -129,14 +129,16 @@ def _validate_and_filter(
     null_mask = np.isnan(propensities)
     if null_mask.all():
         raise ValueError(
-            "All propensity values are null. This campaign uses Thompson Sampling — "
-            "propensity logging for TS is not yet supported. "
-            "Only LinUCB campaigns include propensity scores in the Parquet export."
+            "All propensity values are null. This is a legacy Thompson Sampling export "
+            "from before adaptive Monte Carlo propensity logging was added. "
+            "Re-export from a current BanditDB instance to obtain propensity scores, "
+            "or use causal_analysis.py which does not require logged propensities."
         )
     if null_mask.any():
         warnings.warn(
             f"{int(null_mask.sum())} of {n_total} rows have null propensity "
-            "(Thompson Sampling records) and will be excluded from the estimate.",
+            "(legacy TS records from before adaptive Monte Carlo logging). "
+            "These rows will be excluded from the IPS/SNIPS estimate.",
             stacklevel=3,
         )
 

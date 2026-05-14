@@ -87,22 +87,34 @@ class TestClientInitialisation:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestHealth:
-    """Verifies ``GET /health`` behaviour across all code paths."""
+    """Verifies ``GET /health`` boolean behaviour across all code paths."""
 
-    def test_returns_true_when_server_is_healthy(self, client):
-        client.session.get.return_value = make_response(200, {"status": "ok"})
+    def test_returns_true_when_all_campaigns_are_healthy(self, client):
+        client.session.get.return_value = make_response(200, {
+            "status": "ok",
+            "campaigns": {"prices": {"entropy": 0.82, "status": "ok"}},
+        })
         assert client.health() is True
 
-    def test_returns_false_when_server_is_degraded(self, client):
-        client.session.get.return_value = make_response(503)
+    def test_returns_true_when_entropy_is_degraded_but_wal_is_healthy(self, client):
+        # HTTP 200 with "degraded" status = WAL fine, entropy issue — service is available
+        client.session.get.return_value = make_response(200, {
+            "status": "degraded",
+            "campaigns": {"prices": {"entropy": 0.09, "status": "critical"}},
+        })
+        assert client.health() is True
+
+    def test_returns_false_when_wal_is_unavailable(self, client):
+        client.session.get.return_value = make_response(503, {
+            "status": "degraded: wal unavailable",
+            "campaigns": {},
+        })
         assert client.health() is False
 
     def test_calls_correct_endpoint(self, client):
-        client.session.get.return_value = make_response(200)
+        client.session.get.return_value = make_response(200, {"status": "ok", "campaigns": {}})
         client.health()
-        client.session.get.assert_called_once_with(
-            f"{BASE_URL}/health", timeout=2.0
-        )
+        client.session.get.assert_called_once_with(f"{BASE_URL}/health", timeout=2.0)
 
     def test_raises_timeout_error_when_request_times_out(self, client):
         client.session.get.side_effect = RequestsTimeout()
@@ -113,6 +125,59 @@ class TestHealth:
         client.session.get.side_effect = RequestsConnectionError()
         with pytest.raises(ConnectionError, match="Failed to connect"):
             client.health()
+
+
+class TestHealthDetail:
+    """Verifies ``GET /health`` full-response behaviour via ``health_detail()``."""
+
+    _HEALTHY = {
+        "status": "ok",
+        "campaigns": {
+            "prices":  {"entropy": 0.82, "status": "ok"},
+            "banners": {"entropy": 0.74, "status": "ok"},
+        },
+    }
+    _DEGRADED = {
+        "status": "degraded",
+        "campaigns": {
+            "prices":  {"entropy": 0.09, "status": "critical"},
+            "banners": {"entropy": 0.74, "status": "ok"},
+        },
+    }
+
+    def test_returns_full_dict_when_healthy(self, client):
+        client.session.get.return_value = make_response(200, self._HEALTHY)
+        result = client.health_detail()
+        assert result["status"] == "ok"
+        assert result["campaigns"]["prices"]["entropy"] == 0.82
+
+    def test_returns_full_dict_when_entropy_degraded(self, client):
+        client.session.get.return_value = make_response(200, self._DEGRADED)
+        result = client.health_detail()
+        assert result["status"] == "degraded"
+        assert result["campaigns"]["prices"]["status"] == "critical"
+        assert result["campaigns"]["prices"]["entropy"] == 0.09
+
+    def test_returns_full_dict_when_wal_unavailable(self, client):
+        body = {"status": "degraded: wal unavailable", "campaigns": {}}
+        client.session.get.return_value = make_response(503, body)
+        result = client.health_detail()
+        assert "wal unavailable" in result["status"]
+
+    def test_calls_correct_endpoint(self, client):
+        client.session.get.return_value = make_response(200, self._HEALTHY)
+        client.health_detail()
+        client.session.get.assert_called_once_with(f"{BASE_URL}/health", timeout=2.0)
+
+    def test_raises_timeout_error(self, client):
+        client.session.get.side_effect = RequestsTimeout()
+        with pytest.raises(TimeoutError, match="timed out"):
+            client.health_detail()
+
+    def test_raises_connection_error(self, client):
+        client.session.get.side_effect = RequestsConnectionError()
+        with pytest.raises(ConnectionError, match="Failed to connect"):
+            client.health_detail()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -141,6 +206,7 @@ class TestCreateCampaign:
                 "arms":        self.ARMS,
                 "feature_dim": self.FEATURE_DIM,
                 "alpha":       1.0,
+                "algorithm":   "linucb",
             },
             timeout=2.0,
         )
@@ -155,6 +221,7 @@ class TestCreateCampaign:
                 "arms":        self.ARMS,
                 "feature_dim": self.FEATURE_DIM,
                 "alpha":       2.5,
+                "algorithm":   "linucb",
             },
             timeout=2.0,
         )

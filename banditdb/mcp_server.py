@@ -90,41 +90,68 @@ def list_campaigns() -> str:
 @mcp.tool()
 def campaign_diagnostics(campaign_id: str) -> str:
     """
-    Inspect the learning state of a campaign to diagnose whether it is working.
+    Inspect the learning state and exploration health of a campaign.
 
     Use this when you suspect a campaign is not learning, one arm is dominating,
-    or rewards are not being received. The key signals are:
+    or rewards are not being received. Key signals:
+    - entropy_status: "ok" means healthy. "warning"/"critical" means exploration
+      has collapsed — one arm is absorbing most traffic without a convergence signal.
+    - entropy_trend: "falling" means collapse happened recently (check for pipeline
+      bugs or config changes). "stable" means the current state has been consistent.
+    - likely_cause / suggested_action: present when entropy is degraded, tells you
+      what likely happened and what to do about it.
     - theta_norm: 0.0 means this arm has never been rewarded. Growing means learning.
-    - prediction_count vs reward_count: a large gap means rewards are not closing
-      the loop (TTL expiry, missing record_outcome calls, or a bug in your code).
+    - predictions vs rewards: a large gap means rewards are not closing the loop
+      (TTL expiry, missing record_outcome calls, or a bug in your integration).
 
     Args:
         campaign_id: The campaign to inspect.
 
     Returns:
-        A human-readable diagnostic report with per-arm statistics.
+        A human-readable diagnostic report with per-arm statistics and entropy health.
     """
     try:
-        info = db.campaign_info(campaign_id)
+        d = db.diagnostics(campaign_id)
+        entropy   = d.get("selection_entropy", "n/a")
+        e_status  = d.get("entropy_status", "unknown")
+        e_trend   = d.get("entropy_trend", "unknown")
+        converged = d.get("converged")
+        cause     = d.get("likely_cause")
+        action    = d.get("suggested_action")
+
         lines = [
-            f"Campaign: {info['campaign_id']} "
-            f"(algorithm={info.get('algorithm', 'linucb')}, alpha={info['alpha']})",
-            f"Totals: {info['total_predictions']} predictions, "
-            f"{info['total_rewards']} rewards",
+            f"Campaign: {d['campaign_id']} "
+            f"(algorithm={d.get('algorithm', 'linucb')}, alpha={d.get('alpha', '?')})",
+            f"Totals: {d['total_predictions']} predictions, {d['total_rewards']} rewards",
             "",
-            "Arms:",
+            f"Exploration health:",
+            f"  entropy={entropy:.3f}  status={e_status}  trend={e_trend}"
+            + (f"  converged={converged}" if converged is not None else ""),
         ]
-        for arm_id, arm in sorted(info["arms"].items()):
+        if cause:
+            lines.append(f"  ⚠  likely_cause: {cause}")
+        if action:
+            lines.append(f"     suggested_action: {action}")
+
+        lines += ["", "Arms:"]
+        for arm_id, arm in sorted(d["arm_stats"].items()):
             reward_rate = (
-                f"{arm['reward_count'] / arm['prediction_count']:.0%}"
-                if arm["prediction_count"] > 0
+                f"{arm['rewards'] / arm['predictions']:.0%}"
+                if arm["predictions"] > 0
                 else "n/a"
             )
             lines.append(
                 f"  • {arm_id}: theta_norm={arm['theta_norm']:.4f}, "
-                f"predictions={arm['prediction_count']}, "
-                f"rewards={arm['reward_count']} ({reward_rate})"
+                f"predictions={arm['predictions']}, "
+                f"rewards={arm['rewards']} ({reward_rate})"
             )
+
+        if d.get("challenger_traffic_pct") is not None:
+            lines += [
+                "",
+                f"Tournament: challenger={d['challenger_traffic_pct']:.1f}%  "
+                f"win_streak={d.get('tournament_win_streak', 0)}",
+            ]
         return "\n".join(lines)
     except BanditDBError as e:
         return f"Error fetching campaign diagnostics: {str(e)}"
