@@ -53,17 +53,40 @@ except BanditDBError as e:
 
 ### All Client methods
 
+**Health**
+
 | Method | Description |
 |--------|-------------|
-| `health()` | Returns `True` if the server is reachable and healthy. |
-| `list_campaigns()` | Returns a list of all live campaigns with their `alpha` and `arm_count`. |
-| `campaign_info(campaign_id)` | Returns the full diagnostic state for one campaign: per-arm `theta`, `theta_norm`, `prediction_count`, `reward_count`, and totals. Raises `APIError` (404) if not found. |
-| `create_campaign(campaign_id, arms, feature_dim, alpha=1.0, algorithm="linucb")` | Register a new campaign. `algorithm` is `"linucb"` (default) or `"thompson_sampling"`. `alpha` controls exploration for both — for TS it sets the posterior width; `1.0` is the principled default. |
-| `delete_campaign(campaign_id)` | Delete a campaign. Returns `False` if not found. |
-| `predict(campaign_id, context)` | Returns `(arm_id, interaction_id)`. |
-| `reward(interaction_id, reward)` | Close the feedback loop. Reward must be in `[0, 1]`. |
-| `checkpoint()` | Flush the WAL, snapshot models, write Parquet files, rotate the WAL. Returns a summary string. |
-| `export()` | List per-campaign Parquet files created by `checkpoint()`. Returns a formatted string. |
+| `health()` | Returns `True` if the server is reachable and the WAL writer is healthy. |
+| `health_detail()` | Returns the full health dict including per-campaign `entropy` and `status` (`"ok"` / `"warning"` / `"critical"`). |
+
+**Campaigns**
+
+| Method | Description |
+|--------|-------------|
+| `create_campaign(campaign_id, arms, feature_dim, alpha=1.0, algorithm="linucb", metadata=None)` | Register a new campaign. `algorithm` accepts `"linucb"`, `"thompson_sampling"`, `NeuralLinUCBConfig`, or `ProgressiveConfig`. `metadata` is an arbitrary JSON dict (≤ 64 KB). |
+| `list_campaigns()` | Returns a list of all campaigns (active and archived) with `alpha`, `arm_count`, and `algorithm`. |
+| `campaign_info(campaign_id)` | Returns full per-arm state: `theta`, `theta_norm`, prediction and reward counters. Raises `APIError` (404) if not found. |
+| `report(campaign_id)` | Business-level convergence report. `converged=True` means one arm has a statistically significant lead at 95% CI — safe to stop. `converged=False` means leading but CIs still overlap. `converged=None` means not enough data yet (< 30 rewards per arm). |
+| `diagnostics(campaign_id)` | Operator diagnostics: per-arm theta norms, A_inv uncertainty bounds, entropy health (`selection_entropy`, `entropy_status`, `entropy_trend`, `likely_cause`, `suggested_action`), tournament traffic, and neural buffer size. |
+| `archive_campaign(campaign_id)` | Soft-delete: pauses predictions/rewards but preserves all learned weights. Recoverable with `restore_campaign()`. |
+| `restore_campaign(campaign_id)` | Restore an archived campaign to active status with all weights intact. |
+| `delete_campaign(campaign_id)` | Permanently delete a campaign. Returns `False` if not found. |
+
+**Predict & Reward**
+
+| Method | Description |
+|--------|-------------|
+| `predict(campaign_id, context)` | Returns `(arm_id, interaction_id)`. Pass `interaction_id` to `reward()` to close the loop. |
+| `batch_predict(predictions)` | Predict for up to 100 campaign/context pairs in a single round-trip. Each item: `{"campaign_id": str, "context": List[float]}`. Returns list of `{arm_id, interaction_id}` or `{error}` per item. |
+| `reward(interaction_id, reward)` | Record outcome. `reward` must be in `[0.0, 1.0]`. Raises `APIError` if the interaction has already been rewarded or has expired (default TTL: 24 h). |
+
+**Data & Export**
+
+| Method | Description |
+|--------|-------------|
+| `checkpoint()` | Flush WAL, snapshot models, write Parquet shards, run neural retrain + tournament eval, rotate WAL. Returns a summary string. |
+| `export()` | List Parquet export shards grouped by campaign. Returns `{export_dir, shards}`. |
 
 ---
 
@@ -103,15 +126,19 @@ Add to your Claude configuration file:
 }
 ```
 
-The agent swarm now has five tools:
+The agent swarm now has nine tools:
 
 | Tool | What it does |
 |------|--------------|
 | `create_campaign` | Create a new decision campaign. Accepts `algorithm` (`"linucb"` or `"thompson_sampling"`) and `alpha`. Use Thompson Sampling for natural Bayesian exploration with no tuning needed. |
 | `list_campaigns` | List all active campaigns (shows `algorithm` and `alpha`) — useful to check what exists before calling `get_intuition`. |
-| `campaign_diagnostics` | Inspect per-arm learning state: `theta_norm`, prediction counts, reward rates. Use this when a campaign doesn't seem to be learning. |
+| `campaign_diagnostics` | Inspect per-arm learning state: `theta_norm`, prediction counts, reward rates, and entropy health. Use when a campaign doesn't seem to be learning or one arm is dominating. |
+| `campaign_report` | Business-level convergence report. Tells you whether the campaign has statistically converged and which arm is winning with confidence intervals. |
 | `get_intuition` | Ask BanditDB which arm to pick for a given context. Returns the arm and an `interaction_id` to save. |
+| `batch_get_intuition` | Get decisions for multiple campaigns in a single round-trip. Pass a list of `{campaign_id, context}` dicts. |
 | `record_outcome` | Report whether the chosen action succeeded (1.0) or failed (0.0). Updates the shared model. |
+| `archive_campaign` | Soft-delete a campaign. Pauses predictions/rewards but preserves all learned weights. |
+| `restore_campaign` | Restore an archived campaign to active status with all weights intact. |
 
 Every decision made by any agent in the network improves the routing for all future agents.
 
@@ -194,23 +221,48 @@ print("Observed (logging policy):", df["reward"].mean())
 
 ## Choosing an Algorithm
 
-BanditDB supports two contextual bandit algorithms, selected at campaign creation time.
+BanditDB supports four algorithms, selected at campaign creation time.
 
 | Algorithm | `algorithm` value | Exploration style | When to use |
 |-----------|------------------|-------------------|-------------|
 | **LinUCB** | `"linucb"` (default) | Deterministic UCB bonus: `θ·x + α√(x·A⁻¹·x)` | Predictable, tunable. Sweep `alpha` offline to calibrate. |
-| **Linear Thompson Sampling** | `"thompson_sampling"` | Samples θ̃ ~ N(θ, α²·A⁻¹), scores by θ̃·x | Bayesian posterior — no alpha-sweep needed. `alpha=1.0` is the natural posterior width. Concurrent users automatically diversify choices. |
+| **Linear Thompson Sampling** | `"thompson_sampling"` | Samples θ̃ ~ N(θ, α²·A⁻¹), scores by θ̃·x | Bayesian posterior — no alpha-sweep needed. Concurrent users automatically diversify choices. |
+| **NeuralLinUCB** | `NeuralLinUCBConfig(...)` | Deep MLP embedding + LinUCB in embedding space | Non-linear reward functions. Retrains the MLP every N rewards. |
+| **Progressive** | `ProgressiveConfig(...)` | Self-tuning tournament: runs base + challenger in parallel, shifts traffic to the winner | Zero-configuration model selection. Picks the best algorithm automatically. |
 
 ```python
-# LinUCB (default) — tune alpha to control how long it keeps exploring
+from banditdb import Client, NeuralLinUCBConfig, ProgressiveConfig
+
+db = Client("http://localhost:8080")
+
+# LinUCB (default)
 db.create_campaign("routing", ["fast", "cheap"], feature_dim=4, alpha=1.5)
 
 # Thompson Sampling — natural Bayesian exploration, alpha=1.0 is ideal
 db.create_campaign("routing_ts", ["fast", "cheap"], feature_dim=4,
                    algorithm="thompson_sampling")
+
+# NeuralLinUCB — learns a deep embedding of the context, then applies LinUCB
+cfg = NeuralLinUCBConfig(
+    context_dim=4,     # must match feature_dim
+    embed_dim=32,      # arm matrix dimension (default 32)
+    hidden_dim=128,    # MLP hidden layer width (default 128)
+    retrain_every=200, # retrain the MLP every N cumulative rewards
+)
+db.create_campaign("routing_neural", ["fast", "cheap"], feature_dim=4, algorithm=cfg)
+
+# Progressive — runs LinUCB vs NeuralLinUCB, shifts traffic to whoever wins SNIPS checkpoints
+cfg = ProgressiveConfig(
+    base="linucb",
+    challenger=NeuralLinUCBConfig(context_dim=4, embed_dim=32),
+    min_obs=100,       # minimum buffer entries per arm before any traffic shift
+    required_wins=3,   # consecutive checkpoint wins to earn one traffic step
+    step_bps=1000,     # traffic delta per win run, in basis points (1000 = 10%)
+)
+db.create_campaign("routing_prog", ["fast", "cheap"], feature_dim=4, algorithm=cfg)
 ```
 
-Both algorithms share identical state (A⁻¹, b, θ per arm), so the `predict` → `reward` loop is the same regardless of which you choose.
+All four algorithms share the same `predict` → `reward` loop.
 
 ---
 

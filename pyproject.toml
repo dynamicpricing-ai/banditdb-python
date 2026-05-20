@@ -14,10 +14,21 @@ requires-python = ">=3.8"
 dependencies = [
     "requests>=2.25.0",
     "urllib3>=1.26.0",
-    "mcp>=0.1.0"
+    "mcp>=1.0.0"
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Database",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
 ]
 
 readme = "README.md"
@@ -38,12 +49,16 @@ causal = [
 async = [
     "httpx>=0.27.0",
 ]
+dashboard = [
+    "textual>=0.47.0",
+]
 all = [
     "polars>=0.20.0",
     "numpy>=1.24.0",
     "econml>=0.15.0",
     "scikit-learn>=1.3.0",
     "httpx>=0.27.0",
+    "textual>=0.47.0",
 ]
 dev = [
     "pytest>=7.0",
@@ -53,7 +68,8 @@ dev = [
 ]
 
 [project.scripts]
-banditdb-mcp = "banditdb.mcp_server:main"
+banditdb-mcp       = "banditdb.mcp_server:main"
+banditdb-dashboard = "banditdb.dashboard:main"
 
 [tool.pytest.ini_options]
 testpaths    = ["tests"]

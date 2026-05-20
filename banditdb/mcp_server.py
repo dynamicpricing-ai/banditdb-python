@@ -158,6 +158,153 @@ def campaign_diagnostics(campaign_id: str) -> str:
 
 
 @mcp.tool()
+def campaign_report(campaign_id: str) -> str:
+    """
+    Get the business-level convergence report for a campaign.
+
+    Use this to answer: "Is this campaign done? Which arm is winning?"
+
+    The `converged` field is the key signal:
+      True  — the leading arm has a statistically significant advantage (95% CI).
+              You can safely stop the experiment and deploy the winner.
+      False — one arm leads but confidence intervals still overlap.
+              Keep collecting data.
+      None  — not enough data yet (< 30 rewards per arm).
+
+    Also shows per-arm reward rates with confidence intervals, and for Progressive
+    campaigns: challenger traffic percentage and win streak.
+
+    Args:
+        campaign_id: The campaign to evaluate.
+
+    Returns:
+        A human-readable convergence report with per-arm statistics.
+    """
+    try:
+        r = db.report(campaign_id)
+        lines = [
+            f"Campaign: {r['campaign_id']}",
+            f"Totals: {r['total_predictions']} predictions, {r['total_rewards']} rewards",
+            f"Overall reward rate: {r['overall_reward_rate']:.1%}",
+            f"Leading arm: {r.get('leading_arm', 'n/a')}",
+            f"Converged: {r.get('converged')}",
+            "",
+            "Arms:",
+        ]
+        for arm_id, arm in r.get("arms", {}).items():
+            ci_lo = arm.get("ci_lower", 0)
+            ci_hi = arm.get("ci_upper", 0)
+            lines.append(
+                f"  • {arm_id}: reward_rate={arm.get('reward_rate', 0):.1%} "
+                f"[{ci_lo:.3f}, {ci_hi:.3f}]  "
+                f"predictions={arm.get('predictions', 0)}  "
+                f"traffic={arm.get('traffic_share', 0):.1%}"
+            )
+        if r.get("challenger_traffic_pct") is not None:
+            lines += [
+                "",
+                f"Tournament: challenger={r['challenger_traffic_pct']:.1f}%  "
+                f"win_streak={r.get('tournament_win_streak', 0)}",
+            ]
+        return "\n".join(lines)
+    except BanditDBError as e:
+        return f"Error fetching campaign report: {str(e)}"
+
+
+@mcp.tool()
+def batch_get_intuition(predictions: list[dict]) -> str:
+    """
+    Ask BanditDB for the best action across multiple campaigns in a single round-trip.
+
+    Use this instead of calling get_intuition repeatedly when you need decisions for
+    multiple campaigns at once. More efficient — one network call instead of N.
+
+    Each item in `predictions` must have:
+        campaign_id : str   — the campaign to query
+        context     : list  — feature vector matching that campaign's feature_dim
+
+    Example input:
+        [
+          {"campaign_id": "llm_routing", "context": [0.8, 0.2, 0.5]},
+          {"campaign_id": "support_tier", "context": [0.3, 0.9]}
+        ]
+
+    Args:
+        predictions: List of {"campaign_id": str, "context": list[float]} dicts.
+
+    Returns:
+        One line per campaign with the suggested arm and interaction_id to save.
+    """
+    try:
+        results = db.batch_predict(predictions)
+        lines = [f"Batch results ({len(results)} campaigns):"]
+        for i, r in enumerate(results):
+            if "error" in r:
+                campaign_id = predictions[i].get("campaign_id", f"item {i}")
+                lines.append(f"  • {campaign_id}: ERROR — {r['error']}")
+            else:
+                lines.append(
+                    f"  • {r.get('campaign_id', f'item {i}')}: "
+                    f"arm='{r['arm_id']}'  interaction_id={r['interaction_id']}"
+                )
+        lines.append("")
+        lines.append("[IMPORTANT] Save each interaction_id to call record_outcome later.")
+        return "\n".join(lines)
+    except BanditDBError as e:
+        return f"Error in batch prediction: {str(e)}"
+
+
+@mcp.tool()
+def archive_campaign(campaign_id: str) -> str:
+    """
+    Soft-delete a campaign. The campaign stops accepting new predictions and rewards
+    but all data (arm matrices, history) is preserved and can be restored.
+
+    Use this instead of deleting when you want to pause a campaign without losing
+    its learned weights — for example, to suspend a seasonal campaign and resume it
+    next quarter with the accumulated training data intact.
+
+    Args:
+        campaign_id: The campaign to archive.
+
+    Returns:
+        Confirmation or error message.
+    """
+    try:
+        db.archive_campaign(campaign_id)
+        return (
+            f"Campaign '{campaign_id}' archived. It will no longer accept predictions "
+            f"or rewards. Use restore_campaign('{campaign_id}') to reactivate it."
+        )
+    except BanditDBError as e:
+        return f"Error archiving campaign: {str(e)}"
+
+
+@mcp.tool()
+def restore_campaign(campaign_id: str) -> str:
+    """
+    Restore an archived campaign to active status.
+
+    The campaign resumes accepting predictions and rewards with all previously
+    learned weights intact — no retraining needed.
+
+    Args:
+        campaign_id: The archived campaign to restore.
+
+    Returns:
+        Confirmation or error message.
+    """
+    try:
+        db.restore_campaign(campaign_id)
+        return (
+            f"Campaign '{campaign_id}' restored to active status. "
+            f"It will resume learning from its previous state."
+        )
+    except BanditDBError as e:
+        return f"Error restoring campaign: {str(e)}"
+
+
+@mcp.tool()
 def get_intuition(campaign_id: str, context: list[float]) -> str:
     """
     Ask the BanditDB Hive Mind for the best strategy or action to take.
