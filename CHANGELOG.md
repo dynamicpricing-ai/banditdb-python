@@ -36,6 +36,22 @@
   infinity inside the server's rank-one update, and the resulting NaN persists
   through the checkpoint and survives restart — the campaign is permanently dead.
 
+### Packaging — three fixes found while building 0.2.0
+
+- **`import banditdb` failed on a clean install.** `__init__.py` eagerly imported
+  `eval`, which imports numpy — but numpy lives under the optional `[eval]` extra.
+  A plain `pip install banditdb-python` produced an unusable package unless numpy
+  happened to be present for other reasons. **This affects 0.1.6 on PyPI today.**
+  The submodule now loads on first access, and a missing extra raises an actionable
+  message instead of `ModuleNotFoundError`.
+- **`mcp` was unbounded (`>=1.0.0`) and resolves to 2.0.0**, which removed
+  `mcp.server.fastmcp`. Any install today gets an MCP server that cannot import.
+  Pinned to `>=1.0.0,<2`, matching the API the code targets. **Also affects 0.1.6.**
+- **`banditdb/.claude/settings.local.json` was packaged into the wheel and sdist**,
+  and it contained an API key. Never committed to git and the key is already dead,
+  but it would have gone to PyPI permanently. Build now excludes dotfiles, caches,
+  and stale `*.egg-info`.
+
 ### Changed
 
 - **`reward()` now waits for the server to fsync.** A success response means the

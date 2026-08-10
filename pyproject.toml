@@ -3,6 +3,29 @@ requires = ["hatchling >= 1.26"]
 build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["banditdb"]
+# Hatchling would otherwise sweep in everything under the package directory,
+# including dotfiles. `.claude/settings.local.json` held a live API key and was
+# packaged into both the wheel and the sdist — PyPI artifacts cannot be truly
+# retracted, so this exclusion is the difference between a local file and a
+# permanent credential leak.
+exclude = [
+  "**/.claude",
+  "**/__pycache__",
+  "**/*.pyc",
+  "**/.DS_Store",
+]
+
+[tool.hatch.build.targets.sdist]
+# Same exclusions, plus stale setuptools metadata left over from earlier builds.
+exclude = [
+  "**/.claude",
+  "**/__pycache__",
+  "**/*.pyc",
+  "**/.DS_Store",
+  "*.egg-info",
+  ".pytest_cache",
+  "dist",
+]
 
 
 [project]
@@ -14,7 +37,7 @@ requires-python = ">=3.8"
 dependencies = [
     "requests>=2.25.0",
     "urllib3>=1.26.0",
-    "mcp>=1.0.0"
+    "mcp>=1.0.0,<2"
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
