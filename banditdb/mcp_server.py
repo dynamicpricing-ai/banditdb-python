@@ -21,6 +21,7 @@ def create_campaign(
     feature_dim: int,
     alpha: float = 1.0,
     algorithm: str = "linucb",
+    decay_half_life_hours: float | None = None,
 ) -> str:
     """
     Create a new decision campaign in BanditDB.
@@ -44,18 +45,36 @@ def create_campaign(
                    alpha sweep needed, and concurrent users automatically diversify
                    arm coverage. Use "linucb" when you want deterministic,
                    predictable exploration you can tune via alpha.
+        decay_half_life_hours: Exponential forgetting. Confidence halves every N hours
+                   of real time, applied at each checkpoint. The learned direction
+                   (theta) is preserved — only certainty erodes, so the bandit
+                   re-explores stale knowledge without forgetting what it learned.
+                   None = no forgetting (default). Recommended values:
+                   24.0 for fast-changing contexts (daily drift),
+                   168.0 for weekly drift (good default for agentic memory),
+                   720.0 for slow monthly drift.
 
     Returns:
         Confirmation that the campaign was created, or an error message.
     """
     try:
-        db.create_campaign(campaign_id, arms, feature_dim, alpha=alpha, algorithm=algorithm)
+        db.create_campaign(
+            campaign_id, arms, feature_dim,
+            alpha=alpha, algorithm=algorithm,
+            decay_half_life_hours=decay_half_life_hours,
+        )
+        decay_note = (
+            f", decay_half_life={decay_half_life_hours}h"
+            if decay_half_life_hours is not None else ""
+        )
         return (
             f"✅ Campaign '{campaign_id}' created with {len(arms)} arms: {arms}. "
-            f"feature_dim={feature_dim}, alpha={alpha}, algorithm={algorithm}. "
+            f"feature_dim={feature_dim}, alpha={alpha}, algorithm={algorithm}{decay_note}. "
             f"You can now call get_intuition('{campaign_id}', context) with a "
             f"context vector of {feature_dim} floats."
         )
+    except ValueError as e:
+        return f"Invalid input: {str(e)}"
     except BanditDBError as e:
         return f"Error creating campaign: {str(e)}"
 
@@ -83,6 +102,8 @@ def list_campaigns() -> str:
                 f"alpha={c['alpha']}, algorithm={c.get('algorithm', 'linucb')}"
             )
         return "\n".join(lines)
+    except ValueError as e:
+        return f"Invalid input: {str(e)}"
     except BanditDBError as e:
         return f"Error listing campaigns: {str(e)}"
 
@@ -153,6 +174,8 @@ def campaign_diagnostics(campaign_id: str) -> str:
                 f"win_streak={d.get('tournament_win_streak', 0)}",
             ]
         return "\n".join(lines)
+    except ValueError as e:
+        return f"Invalid input: {str(e)}"
     except BanditDBError as e:
         return f"Error fetching campaign diagnostics: {str(e)}"
 
@@ -207,6 +230,8 @@ def campaign_report(campaign_id: str) -> str:
                 f"win_streak={r.get('tournament_win_streak', 0)}",
             ]
         return "\n".join(lines)
+    except ValueError as e:
+        return f"Invalid input: {str(e)}"
     except BanditDBError as e:
         return f"Error fetching campaign report: {str(e)}"
 
@@ -250,6 +275,8 @@ def batch_get_intuition(predictions: list[dict]) -> str:
         lines.append("")
         lines.append("[IMPORTANT] Save each interaction_id to call record_outcome later.")
         return "\n".join(lines)
+    except ValueError as e:
+        return f"Invalid input: {str(e)}"
     except BanditDBError as e:
         return f"Error in batch prediction: {str(e)}"
 
@@ -276,6 +303,8 @@ def archive_campaign(campaign_id: str) -> str:
             f"Campaign '{campaign_id}' archived. It will no longer accept predictions "
             f"or rewards. Use restore_campaign('{campaign_id}') to reactivate it."
         )
+    except ValueError as e:
+        return f"Invalid input: {str(e)}"
     except BanditDBError as e:
         return f"Error archiving campaign: {str(e)}"
 
@@ -300,6 +329,8 @@ def restore_campaign(campaign_id: str) -> str:
             f"Campaign '{campaign_id}' restored to active status. "
             f"It will resume learning from its previous state."
         )
+    except ValueError as e:
+        return f"Invalid input: {str(e)}"
     except BanditDBError as e:
         return f"Error restoring campaign: {str(e)}"
 
@@ -311,7 +342,9 @@ def get_intuition(campaign_id: str, context: list[float]) -> str:
 
     Args:
         campaign_id: The ID of the decision campaign (e.g., 'llm_routing', 'support_strategy').
-        context: A list of floats representing the current state (e.g., user sentiment, task difficulty).
+        context: A list of finite floats representing the current state (e.g., user
+            sentiment, task difficulty). Keep values on a similar, modest scale —
+            roughly -1 to 1 works well. Very large values are rejected.
 
     Returns:
         A string telling you which action to take, and the interaction_id you MUST save for the reward.
@@ -322,6 +355,8 @@ def get_intuition(campaign_id: str, context: list[float]) -> str:
             f"💡 BanditDB Suggests: Take action '{arm_id}'.\n"
             f"[IMPORTANT] Save this interaction_id for the outcome: {interaction_id}"
         )
+    except ValueError as e:
+        return f"Invalid input: {str(e)}"
     except BanditDBError as e:
         return f"Error connecting to Hive Mind: {str(e)}"
 
@@ -332,7 +367,9 @@ def record_outcome(interaction_id: str, reward: float) -> str:
 
     Args:
         interaction_id: The unique ID returned by get_intuition.
-        reward: 1.0 if the action was a massive success, 0.0 if it failed or was unhelpful.
+        reward: A number between 0.0 and 1.0 — 1.0 for a clear success, 0.0 for a
+            failure, and values in between for partial success. Anything outside
+            this range is rejected, so scale it rather than passing a raw score.
 
     Returns:
         Confirmation that the global math matrices have been updated.
@@ -342,6 +379,8 @@ def record_outcome(interaction_id: str, reward: float) -> str:
         if success:
             return "🧠 Mathematical weights updated! The Swarm has learned from this interaction."
         return "Failed to update weights."
+    except ValueError as e:
+        return f"Invalid input: {str(e)}"
     except BanditDBError as e:
         return f"Error recording outcome: {str(e)}"
 

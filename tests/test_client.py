@@ -128,7 +128,15 @@ class TestHealth:
 
 
 class TestHealthDetail:
-    """Verifies ``GET /health`` full-response behaviour via ``health_detail()``."""
+    """
+    Verifies ``health_detail()`` targets ``GET /health/detail``.
+
+    Server 2.0.0 removed the campaign map from the public ``/health`` — those
+    identifiers carry the tenant prefix and the route is unauthenticated, so exposing
+    them leaked the tenant list. This test previously pinned ``/health``, which meant
+    it passed while ``health_detail()["campaigns"]`` raised KeyError against any
+    2.0.0 server.
+    """
 
     _HEALTHY = {
         "status": "ok",
@@ -167,7 +175,7 @@ class TestHealthDetail:
     def test_calls_correct_endpoint(self, client):
         client.session.get.return_value = make_response(200, self._HEALTHY)
         client.health_detail()
-        client.session.get.assert_called_once_with(f"{BASE_URL}/health", timeout=2.0)
+        client.session.get.assert_called_once_with(f"{BASE_URL}/health/detail", timeout=2.0)
 
     def test_raises_timeout_error(self, client):
         client.session.get.side_effect = RequestsTimeout()

@@ -26,6 +26,7 @@ Quickstart:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
@@ -34,6 +35,70 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .exceptions import APIError, ConnectionError, TimeoutError
+
+# Mirrors BANDITDB_MAX_CONTEXT_MAGNITUDE on the server (default 1e6). Checking here
+# turns a round trip and a 400 into an immediate, local error naming the offending
+# index. Finiteness alone is not enough: a value near 1e155 is finite but squares to
+# infinity inside the server's rank-one update, and the resulting NaN persists
+# through the checkpoint and survives restart.
+MAX_CONTEXT_MAGNITUDE = 1e6
+
+
+def normalize_context(context: List[float]) -> List[float]:
+    """
+    Scale a context vector to unit L2 norm.
+
+    Worth doing. LinUCB scores an arm as ``θ·x + α·√(xᵀA⁻¹x)``; the exploration term
+    scales with ``‖x‖`` and the regret analysis assumes ``‖x‖ ≤ 1``. Feeding
+    unnormalised or heavy-tailed features lets rare high-norm rows dominate arm
+    selection, and the model still converges — just far more slowly, with no error to
+    tell you. On the UCI shuttle benchmark this single change moved cumulative regret
+    from 2,026 to 709 with no other difference.
+
+    If your features have very different ranges, min-max scale each into [0, 1]
+    first, then call this. An all-zero vector is returned unchanged.
+
+    Example::
+
+        db.predict("c", normalize_context([age, income, clicks]))
+    """
+    norm = math.sqrt(sum(v * v for v in context))
+    if norm == 0.0 or not math.isfinite(norm):
+        return list(context)
+    return [v / norm for v in context]
+
+
+def _validate_context(context: List[float]) -> None:
+    """Reject contexts the server would reject, with a clearer message."""
+    if not context:
+        raise ValueError("context must not be empty")
+    for i, v in enumerate(context):
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            raise ValueError(f"context[{i}] must be a number, got {type(v).__name__}")
+        if not math.isfinite(v):
+            raise ValueError(
+                f"context[{i}] is {v}. NaN and infinity propagate into the arm's "
+                "covariance matrix and cannot be cleared without deleting the campaign."
+            )
+        if abs(v) > MAX_CONTEXT_MAGNITUDE:
+            raise ValueError(
+                f"context[{i}] magnitude {abs(v)} exceeds {MAX_CONTEXT_MAGNITUDE:g}. "
+                "Squared terms would overflow during the server's rank-one update. "
+                "Scale your features — normalize_context() is usually what you want."
+            )
+
+
+def _validate_reward(reward: float) -> None:
+    if not isinstance(reward, (int, float)) or isinstance(reward, bool):
+        raise ValueError(f"reward must be a number, got {type(reward).__name__}")
+    if not math.isfinite(reward):
+        raise ValueError(f"reward must be finite, got {reward}")
+    if not 0.0 <= reward <= 1.0:
+        raise ValueError(
+            f"reward {reward} is outside [0.0, 1.0]. Server 2.0.0+ rejects this with "
+            "400 — the confidence bounds and the SNIPS estimator both assume the range. "
+            "Rescale your outcome, e.g. revenue / max_revenue."
+        )
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +295,11 @@ class Client:
         Returns True for both ``"ok"`` and ``"degraded"`` overall status — both mean
         the service is available. Returns False only for HTTP 503 (WAL writer failure).
         Use ``health_detail()`` to inspect per-campaign entropy status.
+
+        This endpoint is public and deliberately carries no campaign data. Since
+        server 2.0.0 it returns only ``{status, version, features}`` — campaign
+        identifiers moved to ``/health/detail`` because they would otherwise expose
+        the tenant list to unauthenticated callers.
         """
         try:
             r = self.session.get(f"{self.url}/health", timeout=self.timeout)
@@ -239,9 +309,37 @@ class Client:
         except requests.exceptions.ConnectionError:
             raise ConnectionError(f"Failed to connect to BanditDB at {self.url}")
 
+    def server_info(self) -> dict:
+        """
+        Return ``{status, version, features}`` from the public health endpoint.
+
+        ``features`` lists the Cargo features the server was compiled with. An empty
+        list means a plain build: neural algorithms are unavailable and campaigns
+        requesting them are rejected at creation.
+
+        Returns ``{}`` for servers older than 2.0.0, which did not report a version.
+
+        Example::
+
+            info = db.server_info()
+            if "neural" not in info.get("features", []):
+                print("server cannot run NeuralLinUCB campaigns")
+        """
+        try:
+            r = self.session.get(f"{self.url}/health", timeout=self.timeout)
+            body = r.json()
+        except requests.exceptions.Timeout:
+            raise TimeoutError(f"Health check timed out after {self.timeout}s")
+        except requests.exceptions.ConnectionError:
+            raise ConnectionError(f"Failed to connect to BanditDB at {self.url}")
+        return {k: body[k] for k in ("status", "version", "features") if k in body}
+
     def health_detail(self) -> dict:
         """
-        Return the full health response including per-campaign entropy status.
+        Return per-campaign entropy status, scoped to the caller's tenant.
+
+        Requires an API key (reader role or above) and server 2.0.0+, which moved
+        this data off the public ``/health`` endpoint.
 
         Returns a dict with:
             status    : ``"ok"`` | ``"degraded"`` | ``"degraded: wal unavailable"``
@@ -261,7 +359,14 @@ class Client:
                     print(f"{cid}: entropy={h['entropy']:.2f} ({h['status']})")
         """
         try:
-            r = self.session.get(f"{self.url}/health", timeout=self.timeout)
+            r = self.session.get(f"{self.url}/health/detail", timeout=self.timeout)
+            if r.status_code == 404:
+                raise APIError(
+                    "GET /health/detail returned 404 — this server predates 2.0.0. "
+                    "Older servers return campaign data from /health instead."
+                )
+            if r.status_code == 401:
+                raise APIError("/health/detail requires an API key (reader role or above).")
             return r.json()
         except requests.exceptions.Timeout:
             raise TimeoutError(f"Health check timed out after {self.timeout}s")
@@ -272,25 +377,31 @@ class Client:
 
     def create_campaign(
         self,
-        campaign_id: str,
-        arms:        List[str],
-        feature_dim: int,
-        alpha:       float                = 1.0,
-        algorithm:   Algorithm            = "linucb",
-        metadata:    Optional[dict]       = None,
+        campaign_id:          str,
+        arms:                 List[str],
+        feature_dim:          int,
+        alpha:                float          = 1.0,
+        algorithm:            Algorithm      = "linucb",
+        metadata:             Optional[dict] = None,
+        decay_half_life_hours: Optional[float] = None,
     ) -> bool:
         """
         Create a new decision campaign.
 
         Parameters
         ----------
-        campaign_id : Unique identifier. ASCII alphanumeric, hyphens, and underscores only.
-        arms        : Decision options (e.g. ["gpt-4o", "claude-haiku", "llama-3"]).
-        feature_dim : Length of the context vector you will pass to predict().
-                      For NeuralLinUCBConfig this is context_dim, not embed_dim.
-        alpha       : Exploration / exploitation trade-off (LinUCB and TS). Default 1.0.
-        algorithm   : "linucb" | "thompson_sampling" | NeuralLinUCBConfig | ProgressiveConfig.
-        metadata    : Arbitrary JSON dict stored with the campaign (≤ 64 KB).
+        campaign_id           : Unique identifier. ASCII alphanumeric, hyphens, and underscores only.
+        arms                  : Decision options (e.g. ["gpt-4o", "claude-haiku", "llama-3"]).
+        feature_dim           : Length of the context vector you will pass to predict().
+                                For NeuralLinUCBConfig this is context_dim, not embed_dim.
+        alpha                 : Exploration / exploitation trade-off (LinUCB and TS). Default 1.0.
+        algorithm             : "linucb" | "thompson_sampling" | NeuralLinUCBConfig | ProgressiveConfig.
+        metadata              : Arbitrary JSON dict stored with the campaign (≤ 64 KB).
+        decay_half_life_hours : Exponential forgetting. Confidence halves every N hours of
+                                real time, measured at each checkpoint. Theta (best estimate)
+                                is preserved — only certainty erodes, forcing re-exploration
+                                as evidence ages. None = no forgetting (default).
+                                Examples: 24.0 (daily drift), 168.0 (weekly), 720.0 (monthly).
 
         Returns True on success. Raises APIError if the campaign already exists.
         """
@@ -303,6 +414,8 @@ class Client:
         }
         if metadata is not None:
             payload["metadata"] = metadata
+        if decay_half_life_hours is not None:
+            payload["decay_half_life_hours"] = decay_half_life_hours
         return self._post("/campaign", payload) == "Campaign Created"
 
     def list_campaigns(self) -> List[dict]:
@@ -403,11 +516,19 @@ class Client:
         ----------
         campaign_id : Which campaign to query.
         context     : Feature vector. Length must match the campaign's feature_dim.
+                      Values must be finite and within ±1e6. Normalise to unit L2
+                      norm — see normalize_context() for why it matters.
 
         Returns
         -------
         (arm_id, interaction_id)
+
+        Raises
+        ------
+        ValueError : context is empty, non-finite, or too large. Checked locally so
+                     you get the offending index rather than a 400 from the server.
         """
+        _validate_context(context)
         data = self._post("/predict", {"campaign_id": campaign_id, "context": context})
         return data["arm_id"], data["interaction_id"]
 
@@ -435,7 +556,20 @@ class Client:
         for r in results:
             if "error" not in r:
                 print(r["arm_id"], r["interaction_id"])
+
+        Raises
+        ------
+        ValueError : any item is missing a key or carries an invalid context. The
+                     whole batch is checked before sending, so one bad item does not
+                     consume a round trip.
         """
+        for i, item in enumerate(predictions):
+            if "campaign_id" not in item or "context" not in item:
+                raise ValueError(f"predictions[{i}] needs both 'campaign_id' and 'context'")
+            try:
+                _validate_context(item["context"])
+            except ValueError as e:
+                raise ValueError(f"predictions[{i}]: {e}") from None
         return self._post("/batch_predict", {"predictions": predictions})
 
     def reward(self, interaction_id: str, reward: float) -> bool:
@@ -445,12 +579,60 @@ class Client:
         Parameters
         ----------
         interaction_id : Returned by predict() or batch_predict().
-        reward         : Observed outcome in [0.0, 1.0].
+        reward         : Observed outcome in [0.0, 1.0]. Values outside the range are
+                         rejected — rescale instead (e.g. revenue / max_revenue).
 
         Returns True on success. Raises APIError if the interaction_id has
         already been rewarded or has expired (default TTL: 24 hours).
+
+        **This call waits for the server to fsync.** Since 2.0.0 a success response
+        means the reward is on disk and survives power loss, which costs roughly
+        3.4 ms. The server amortises the fsync across concurrent callers, so
+        submitting rewards in parallel reaches far higher throughput (~4,400/s) than
+        a serial loop. Batch or thread if throughput matters.
+
+        Raises
+        ------
+        ValueError : reward is non-finite or outside [0.0, 1.0].
         """
+        _validate_reward(reward)
         return self._post("/reward", {"interaction_id": interaction_id, "reward": reward}) == "OK"
+
+    def interact(
+        self,
+        campaign_id: str,
+        arm_id: str,
+        context: List[float],
+        reward: float,
+    ) -> str:
+        """
+        Record a decision that was made elsewhere, together with its outcome.
+
+        For backfilling a model from existing logs: you already know which arm was
+        shown and what happened, so there is nothing to predict. Both records are
+        written durably before this returns.
+
+        Parameters
+        ----------
+        campaign_id : Must already exist.
+        arm_id      : The arm that was actually shown.
+        context     : Feature vector, same constraints as predict().
+        reward      : Observed outcome in [0.0, 1.0].
+
+        Returns the interaction_id assigned to the backfilled record.
+
+        Example::
+
+            for row in historical_log:
+                db.interact("prices", row.variant, row.features, row.converted)
+        """
+        _validate_context(context)
+        _validate_reward(reward)
+        data = self._post(
+            f"/campaign/{campaign_id}/interact",
+            {"arm_id": arm_id, "context": context, "reward": reward},
+        )
+        return data["interaction_id"]
 
     # -- Checkpoint / Export ----------------------------------------------------
 
