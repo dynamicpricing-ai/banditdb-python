@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -45,14 +46,23 @@ def _conv_style(converged) -> Tuple[str, str]:
         return "#60A5FA", "running"
     return "#606060", "no data"
 
-def _algo_color(algo: str) -> str:
+def _algo_name(algo) -> str:
+    """Normalise algorithm field — server may return a string or a dict enum."""
+    if isinstance(algo, dict):
+        key = next(iter(algo), "linucb")
+        return key.lower()
+    return str(algo).lower()
+
+def _algo_color(algo) -> str:
     colors = {
-        "linucb":      "#60A5FA",
-        "thompson":    "#A78BFA",
-        "neural":      "#F472B6",
-        "tournament":  "#FB923C",
+        "linucb":         "#60A5FA",
+        "thompson":       "#A78BFA",
+        "neural_lin_ucb": "#F472B6",
+        "neural":         "#F472B6",
+        "progressive":    "#FB923C",
+        "tournament":     "#FB923C",
     }
-    return colors.get(algo.lower(), "#A0A0A0")
+    return colors.get(_algo_name(algo), "#A0A0A0")
 
 def _parse_prometheus(text: str) -> Dict[str, str]:
     """Parse flat Prometheus text into {metric_name: value} for scalar gauges/counters."""
@@ -81,6 +91,49 @@ def _reward_gap_pct(preds: int, rewards: int) -> str:
     if gap > 3:
         return f"[#EAB308]{gap:.1f}%[/#EAB308]"
     return f"[#22C55E]{gap:.1f}%[/#22C55E]"
+
+
+# ── simulation helpers ─────────────────────────────────────────────────────────
+
+_SPARKS = "▁▂▃▄▅▆▇█"
+_SIM_ARM_COLORS = ["#60A5FA", "#A78BFA", "#34D399", "#F472B6", "#FB923C", "#FACC15"]
+
+
+def _sparkline(values: List[float], width: int = 32, vmin: float = 0.0, vmax: float = 1.0) -> str:
+    if not values:
+        return "─" * width
+    n = len(values)
+    if n <= width:
+        sampled = list(values) + [values[-1]] * (width - n)
+    else:
+        sampled = [values[int(i * (n - 1) / (width - 1))] for i in range(width)]
+    span = vmax - vmin
+    if span == 0:
+        return "▄" * width
+    def _b(v: float) -> str:
+        return _SPARKS[max(0, min(7, int(max(0.0, min(1.0, (v - vmin) / span)) * 7)))]
+    return "".join(_b(v) for v in sampled)
+
+
+def _ci_bar(lo: Optional[float], hi: Optional[float], mean: Optional[float], width: int = 26) -> str:
+    if lo is None or hi is None or mean is None:
+        return "[" + "─" * width + "]"
+    lo   = max(0.0, min(1.0, lo))
+    hi   = max(0.0, min(1.0, hi))
+    mean = max(0.0, min(1.0, mean))
+    bar  = ["─"] * width
+    lo_p, hi_p, mid_p = int(lo * (width - 1)), int(hi * (width - 1)), int(mean * (width - 1))
+    for i in range(lo_p, hi_p + 1):
+        if 0 <= i < width:
+            bar[i] = "─"
+    if 0 <= lo_p  < width: bar[lo_p]  = "├"
+    if 0 <= hi_p  < width: bar[hi_p]  = "┤"
+    if 0 <= mid_p < width: bar[mid_p] = "●"
+    return "[" + "".join(bar) + "]"
+
+
+def _sim_arm_color(idx: int) -> str:
+    return _SIM_ARM_COLORS[idx % len(_SIM_ARM_COLORS)]
 
 
 # ── data fetch ────────────────────────────────────────────────────────────────
@@ -322,6 +375,47 @@ Footer {
     color: #606060;
     border-top: solid #2A2A2A;
 }
+
+/* Simulation screen */
+#sim-header {
+    height: 2;
+    background: #111111;
+    border-bottom: solid #2A2A2A;
+    padding: 0 2;
+    align: left middle;
+    color: #F5F5F5;
+}
+
+#sim-body {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#sim-left {
+    width: 1fr;
+    border-right: solid #2A2A2A;
+    padding: 1 2;
+}
+
+#sim-right {
+    width: 1fr;
+    padding: 1 2;
+}
+
+.sim-title {
+    color: #A78BFA;
+    text-style: bold;
+    margin-top: 1;
+    margin-bottom: 1;
+}
+
+#sim-bar {
+    height: 1;
+    background: #111111;
+    border-top: solid #2A2A2A;
+    padding: 0 2;
+    color: #606060;
+}
 """
 
 
@@ -385,10 +479,11 @@ class CampaignDetailScreen(Screen):
 
         # Update header
         algo_color = _algo_color(algo)
+        algo_str   = _algo_name(algo)
         hdr = self.query_one("#detail-header", Static)
         hdr.update(
             f"← [dim]Back (Esc)[/dim]  [bold #F5F5F5]{self._campaign_id}[/bold #F5F5F5]  "
-            f"[{algo_color}]{algo}[/{algo_color}] · α={alpha} · {arm_count} arms"
+            f"[{algo_color}]{algo_str}[/{algo_color}] · α={alpha} · {arm_count} arms"
         )
 
         # Arm table
@@ -505,14 +600,431 @@ class CampaignDetailScreen(Screen):
             self.query_one("#theta-stats", Static).update("[#606060]No arm diagnostics available[/#606060]")
 
 
+# ── simulation screen ─────────────────────────────────────────────────────────
+
+class SimulationScreen(Screen):
+    """
+    Runs a synthetic predict/reward loop on a cloned campaign and visualises
+    the full cold-start → convergence learning arc in real time.
+
+    Creates _sim_<campaign_id>, runs batches of random-context predictions with
+    configurable true reward rates, plots entropy decay, arm concentration, theta
+    norm growth, and CI narrowing. Auto-deletes the sim campaign on exit.
+    """
+
+    BINDINGS = [
+        Binding("escape,q", "back", "Back"),
+        Binding("space",    "toggle_sim",  "Start/Stop"),
+        Binding("r",        "reset_sim",   "Reset"),
+        Binding("plus",     "speed_up",    "+Speed"),
+        Binding("minus",    "slow_down",   "-Speed"),
+    ]
+
+    _SIM_PREFIX = "_sim_"
+
+    def __init__(self, db: Client, campaign_id: str, **kwargs):
+        super().__init__(**kwargs)
+        self._source_id = campaign_id
+        self._sim_id    = f"{self._SIM_PREFIX}{campaign_id}"
+        self._info_db   = db  # original client for setup (reliable timeout)
+        # Dedicated client with short timeout so failed predict calls don't stall batches
+        self._db = Client(
+            url=db.url,
+            timeout=0.5,
+            max_retries=0,
+            api_key=db.session.headers.get("X-Api-Key"),
+        )
+
+        # Populated after info fetch
+        self._feature_dim:  int              = 3
+        self._arms:         List[str]        = []
+        self._arm_colors:   Dict[str, str]   = {}
+        self._true_rewards: Dict[str, float] = {}
+        self._raw_algo:     Any              = "linucb"
+        self._alpha:        float            = 1.0
+
+        # Sim state
+        self._sim_created  = False
+        self._running      = False
+        self._tick_busy    = False
+        self._step         = 0
+        self._batch        = 10
+        self._sim_timer    = None
+
+        # History (one entry per tick)
+        self._entropy_hist: List[float]           = []
+        self._traffic_hist: Dict[str, List[float]] = {}
+        self._theta_hist:   Dict[str, List[float]] = {}
+        self._ci_snap:      Dict[str, dict]        = {}
+
+        self._executor = ThreadPoolExecutor(max_workers=1)
+
+    # ── layout ────────────────────────────────────────────────────────────────
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="sim-header")
+        with Horizontal(id="sim-body"):
+            with ScrollableContainer(id="sim-left"):
+                yield Static("ENTROPY  [dim]uncertainty → confidence[/dim]",            classes="sim-title")
+                yield Static("[#606060]waiting…[/#606060]",                              id="entropy-chart")
+                yield Rule()
+                yield Static("ARM CONCENTRATION  [dim]cold-start → dominant arm[/dim]", classes="sim-title")
+                yield Static("",                                                          id="concentration-chart")
+                yield Rule()
+                yield Static("SIMULATION SETUP",                                          classes="sim-title")
+                yield Static("",                                                          id="sim-config")
+            with ScrollableContainer(id="sim-right"):
+                yield Static("THETA NORMS  [dim]weight growth = learning[/dim]",          classes="sim-title")
+                yield Static("",                                                           id="theta-chart")
+                yield Rule()
+                yield Static("CONFIDENCE INTERVALS  [dim]narrowing = confident[/dim]",    classes="sim-title")
+                yield Static("",                                                           id="ci-chart")
+                yield Rule()
+                yield Static("LEARNING PHASE",                                             classes="sim-title")
+                yield Static("",                                                           id="phase-panel")
+        yield Static("", id="sim-bar")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._update_header()
+        self._update_bar("Loading campaign…")
+        f = self._executor.submit(self._fetch_info)
+        self.set_timer(0.1, lambda: self._poll_info(f))
+
+    # ── setup ─────────────────────────────────────────────────────────────────
+
+    def _fetch_info(self) -> dict:
+        try:
+            return {"ok": True, "info": self._info_db._get(f"/campaign/{self._source_id}")}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def _poll_info(self, f) -> None:
+        if not f.done():
+            self.set_timer(0.1, lambda: self._poll_info(f))
+            return
+        r = f.result()
+        if not r["ok"]:
+            self._update_bar(f"[#EF4444]Error: {r['error']}[/#EF4444]")
+            return
+        info = r["info"]
+        self._feature_dim = info.get("feature_dim", 3)
+        self._raw_algo    = info.get("algorithm", "linucb")
+        self._alpha       = info.get("alpha", 1.0)
+        arms_raw = info.get("arms", {})
+        self._arms = sorted(arms_raw.keys()) if isinstance(arms_raw, dict) else [str(a) for a in arms_raw]
+        n = len(self._arms)
+        for i, arm in enumerate(self._arms):
+            self._arm_colors[arm]    = _sim_arm_color(i)
+            self._true_rewards[arm]  = round(0.70 - i * (0.40 / max(n - 1, 1)), 2)
+        self._render_config()
+        self._update_header()
+        self._update_bar(
+            "[#A0A0A0][Space] start · [+/-] speed · [R] reset · [Esc] back[/#A0A0A0]"
+        )
+
+    def _render_config(self) -> None:
+        ac    = _algo_color(self._raw_algo)
+        aname = _algo_name(self._raw_algo)
+        lines = [
+            f"[#A0A0A0]Algorithm  [/#A0A0A0][{ac}]{aname}[/{ac}]  "
+            f"[#A0A0A0]α=[/#A0A0A0][#F5F5F5]{self._alpha}[/#F5F5F5]  "
+            f"[#A0A0A0]dim=[/#A0A0A0][#F5F5F5]{self._feature_dim}[/#F5F5F5]",
+            "",
+            "[#606060]Simulated true reward rates (arm 0 = best):[/#606060]",
+        ]
+        for arm in self._arms:
+            rate  = self._true_rewards[arm]
+            color = self._arm_colors[arm]
+            f_    = int(rate * 12)
+            bar   = f"[{color}]{'█' * f_}[/{color}][#2A2A2A]{'░' * (12 - f_)}[/#2A2A2A]"
+            lines.append(f"  [{color}]{arm:<14}[/{color}]  {bar}  [#F5F5F5]{rate:.2f}[/#F5F5F5]")
+        self.query_one("#sim-config", Static).update("\n".join(lines))
+
+    # ── actions ───────────────────────────────────────────────────────────────
+
+    def action_back(self) -> None:
+        self._running = False
+        if self._sim_timer:
+            self._sim_timer.stop()
+        if self._sim_created:
+            self._executor.submit(lambda: self._info_db.delete_campaign(self._sim_id))
+        self.app.pop_screen()
+
+    def action_toggle_sim(self) -> None:
+        if not self._arms:
+            return
+        if self._running:
+            self._running = False
+            if self._sim_timer:
+                self._sim_timer.stop()
+                self._sim_timer = None
+            self._update_bar("[#EAB308]Paused[/#EAB308] — Space to resume")
+        elif self._sim_created:
+            self._start_ticking()
+        else:
+            self._update_bar("[#A0A0A0]Creating sim campaign…[/#A0A0A0]")
+            f = self._executor.submit(self._create_campaign)
+            self.set_timer(0.1, lambda: self._poll_create(f))
+
+    def action_reset_sim(self) -> None:
+        self._running = False
+        if self._sim_timer:
+            self._sim_timer.stop()
+            self._sim_timer = None
+        if self._sim_created:
+            self._executor.submit(lambda: self._info_db.delete_campaign(self._sim_id))
+            self._sim_created = False
+        self._step = 0
+        self._tick_busy = False
+        self._entropy_hist.clear()
+        self._traffic_hist.clear()
+        self._theta_hist.clear()
+        self._ci_snap.clear()
+        for wid in ("#entropy-chart", "#concentration-chart", "#theta-chart", "#ci-chart", "#phase-panel"):
+            self.query_one(wid, Static).update("[#606060]—[/#606060]")
+        self._update_header()
+        self._update_bar("[#A0A0A0]Reset — Space to start new run[/#A0A0A0]")
+
+    def action_speed_up(self) -> None:
+        self._batch = min(200, int(self._batch * 1.5) + 1)
+        self._update_header()
+
+    def action_slow_down(self) -> None:
+        self._batch = max(5, int(self._batch / 1.5))
+        self._update_header()
+
+    # ── sim lifecycle ─────────────────────────────────────────────────────────
+
+    def _create_campaign(self) -> dict:
+        try:
+            try: self._info_db.delete_campaign(self._sim_id)
+            except Exception: pass
+            self._info_db._post("/campaign", {
+                "campaign_id": self._sim_id,
+                "arms":        self._arms,
+                "feature_dim": self._feature_dim,
+                "alpha":       self._alpha,
+                "algorithm":   self._raw_algo,
+            })
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def _poll_create(self, f) -> None:
+        if not f.done():
+            self.set_timer(0.1, lambda: self._poll_create(f))
+            return
+        r = f.result()
+        if not r["ok"]:
+            self._update_bar(f"[#EF4444]Create failed: {r['error']}[/#EF4444]")
+            return
+        self._sim_created = True
+        self._start_ticking()
+
+    def _start_ticking(self) -> None:
+        self._running   = True
+        self._sim_timer = self.set_interval(0.25, self._on_tick)
+        self._update_header()
+
+    def _on_tick(self) -> None:
+        if not self._running or self._tick_busy:
+            return
+        self._tick_busy = True
+        f = self._executor.submit(self._run_batch, self._batch)
+        self.set_timer(0.05, lambda: self._poll_batch(f))
+
+    def _run_batch(self, n: int) -> dict:
+        for _ in range(n):
+            ctx = [random.gauss(0, 1) for _ in range(self._feature_dim)]
+            try:
+                arm_id, iid = self._db.predict(self._sim_id, ctx)
+                p = self._true_rewards.get(arm_id, 0.5)
+                r = 1.0 if random.random() < p else 0.0
+                self._db.reward(iid, r)
+            except Exception:
+                pass
+        try:    report = self._db.report(self._sim_id)
+        except: report = {}
+        try:    diag   = self._db.diagnostics(self._sim_id)
+        except: diag   = {}
+        return {"report": report, "diag": diag}
+
+    def _poll_batch(self, f) -> None:
+        if not f.done():
+            self.set_timer(0.05, lambda: self._poll_batch(f))
+            return
+        self._tick_busy = False
+        if not self._running:
+            return
+        self._step += self._batch
+        r = f.result()
+        self._ingest(r["report"], r["diag"])
+        self._render_all(r["report"], r["diag"])
+        self._update_header()
+
+    def _ingest(self, report: dict, diag: dict) -> None:
+        entropy = diag.get("selection_entropy")
+        if entropy is not None:
+            self._entropy_hist.append(entropy)
+        for arm_id, s in report.get("arms", {}).items():
+            self._traffic_hist.setdefault(arm_id, []).append(s.get("traffic_share", 0) or 0)
+        arm_diags = diag.get("arm_stats", {}) or diag.get("arms", {}) or {}
+        for arm_id, ad in arm_diags.items():
+            self._theta_hist.setdefault(arm_id, []).append(ad.get("theta_norm", 0) or 0)
+        for arm_id, s in report.get("arms", {}).items():
+            self._ci_snap[arm_id] = {
+                "lo":    s.get("lower_ci"),
+                "hi":    s.get("upper_ci"),
+                "mean":  s.get("mean_reward"),
+                "preds": s.get("predictions", 0) or 0,
+            }
+
+    # ── rendering ─────────────────────────────────────────────────────────────
+
+    def _update_header(self) -> None:
+        if self._running:
+            state = "[#22C55E]▶ RUNNING[/#22C55E]"
+        elif self._step > 0:
+            state = "[#EAB308]⏸ PAUSED[/#EAB308]"
+        else:
+            state = "[#606060]READY[/#606060]"
+        self.query_one("#sim-header", Static).update(
+            f"[#F97316]SIM[/#F97316]  [bold #F5F5F5]{self._source_id}[/bold #F5F5F5]  "
+            f"{state}  [#F5F5F5]{self._step:,}[/#F5F5F5] [#606060]steps · {self._batch}/tick[/#606060]"
+        )
+
+    def _update_bar(self, msg: str) -> None:
+        try:
+            self.query_one("#sim-bar", Static).update(msg)
+        except Exception:
+            pass
+
+    def _render_all(self, report: dict, diag: dict) -> None:
+        self._render_entropy()
+        self._render_concentration()
+        self._render_theta()
+        self._render_ci()
+        self._render_phase(report, diag)
+
+    def _render_entropy(self) -> None:
+        h = self._entropy_hist
+        if not h:
+            return
+        spark = _sparkline(h, width=40)
+        cur   = h[-1]
+        ec    = "#22C55E" if cur > 0.6 else ("#EAB308" if cur > 0.3 else "#60A5FA")
+        label = "exploring" if cur > 0.6 else ("focusing" if cur > 0.3 else "converged")
+        self.query_one("#entropy-chart", Static).update(
+            f"[#606060]1.0 ╷[/#606060]\n"
+            f"[#606060]    │[/#606060][#A78BFA]{spark}[/#A78BFA]\n"
+            f"[#606060]0.0 ╵[/#606060]  [{ec}]{cur:.3f}  {label}[/{ec}]  "
+            f"[#606060]n={len(h)}[/#606060]"
+        )
+
+    def _render_concentration(self) -> None:
+        if not self._traffic_hist:
+            return
+        lines = []
+        for arm in self._arms:
+            hist  = self._traffic_hist.get(arm, [])
+            cur   = hist[-1] if hist else 0.0
+            color = self._arm_colors.get(arm, "#A0A0A0")
+            spark = _sparkline(hist, width=18) if hist else "─" * 18
+            f_    = int(cur * 14)
+            bar   = f"[{color}]{'█' * f_}[/{color}][#2A2A2A]{'░' * (14 - f_)}[/#2A2A2A]"
+            lines.append(
+                f"[{color}]{arm:<12}[/{color}] [#404040]{spark}[/#404040] {bar} "
+                f"[#F5F5F5]{cur * 100:5.1f}%[/#F5F5F5]"
+            )
+        self.query_one("#concentration-chart", Static).update("\n".join(lines))
+
+    def _render_theta(self) -> None:
+        if not self._theta_hist:
+            self.query_one("#theta-chart", Static).update(
+                "[#606060]No theta data yet — needs more steps[/#606060]"
+            )
+            return
+        all_vals = [v for h in self._theta_hist.values() for v in h]
+        vmax     = max(all_vals) if all_vals else 1.0
+        lines    = []
+        for arm in self._arms:
+            hist  = self._theta_hist.get(arm, [])
+            if not hist:
+                continue
+            spark = _sparkline(hist, width=28, vmin=0.0, vmax=max(vmax, 0.001))
+            cur   = hist[-1]
+            color = self._arm_colors.get(arm, "#A0A0A0")
+            tc    = "#22C55E" if cur > 0.5 else ("#EAB308" if cur > 0.1 else "#606060")
+            lines.append(
+                f"[{color}]{arm:<12}[/{color}] [#383838]{spark}[/#383838] [{tc}]{cur:.3f}[/{tc}]"
+            )
+        self.query_one("#theta-chart", Static).update(
+            "\n".join(lines) if lines else "[#606060]—[/#606060]"
+        )
+
+    def _render_ci(self) -> None:
+        if not self._ci_snap:
+            return
+        lines = []
+        for arm in self._arms:
+            s     = self._ci_snap.get(arm, {})
+            lo, hi, mean = s.get("lo"), s.get("hi"), s.get("mean")
+            preds = s.get("preds", 0)
+            color = self._arm_colors.get(arm, "#A0A0A0")
+            w     = (hi - lo) if (lo is not None and hi is not None) else None
+            cc    = "#22C55E" if (w is not None and w < 0.10) else (
+                    "#EAB308" if (w is not None and w < 0.30) else "#EF4444")
+            label = ("confident" if (w is not None and w < 0.10) else
+                     "learning"  if (w is not None and w < 0.30) else "uncertain")
+            bar   = _ci_bar(lo, hi, mean)
+            w_s   = f"±{w / 2:.3f}" if w is not None else "   —   "
+            lines.append(
+                f"[{color}]{arm:<12}[/{color}] [{cc}]{bar}[/{cc}] [{cc}]{w_s} {label}[/{cc}]"
+            )
+            if mean is not None:
+                lines.append(f"  [#606060]mean={mean:.3f}  n={preds}[/#606060]")
+            lines.append("")
+        self.query_one("#ci-chart", Static).update("\n".join(lines))
+
+    def _render_phase(self, report: dict, diag: dict) -> None:
+        converged = report.get("converged")
+        leader    = report.get("leading_arm") or "—"
+        step      = self._step
+
+        if step == 0:
+            phase, pc = "COLD START", "#606060"
+            desc = "No data. Model uses equal priors across all arms."
+        elif step < 100:
+            phase, pc = "EXPLORATION", "#60A5FA"
+            desc = "Gathering first observations. All arms sampled."
+        elif converged is None:
+            phase, pc = "LEARNING", "#EAB308"
+            desc = "Fitting reward model. Confidence intervals still wide."
+        elif not converged:
+            phase, pc = "FOCUSING", "#F472B6"
+            desc = f"Leader: {leader}. CIs overlap — not decisive yet."
+        else:
+            phase, pc = "CONVERGED", "#22C55E"
+            desc = f"Winner: {leader}. Statistical significance reached."
+
+        entropy_s = f"{self._entropy_hist[-1]:.3f}" if self._entropy_hist else "—"
+        self.query_one("#phase-panel", Static).update(
+            f"[{pc}]◉ {phase}[/{pc}]\n"
+            f"[#A0A0A0]{desc}[/#A0A0A0]\n\n"
+            f"[#606060]steps {step:,}  entropy {entropy_s}[/#606060]"
+        )
+
+
 # ── main screen ───────────────────────────────────────────────────────────────
 
 class BanditDBDashboard(App):
     TITLE = "BanditDB Monitor"
     CSS   = DASHBOARD_CSS
     BINDINGS = [
-        Binding("q", "quit", "Quit"),
-        Binding("r", "refresh", "Refresh"),
+        Binding("q", "quit",     "Quit"),
+        Binding("r", "refresh",  "Refresh"),
+        Binding("s", "simulate", "Simulate"),
     ]
 
     _overview: reactive[dict] = reactive({})
@@ -537,7 +1049,7 @@ class BanditDBDashboard(App):
             yield Static("", id="tile-preds",     classes="stat-tile")
             yield Static("", id="tile-alerts",    classes="stat-tile")
             yield Static("", id="tile-converged", classes="stat-tile")
-        yield Static("CAMPAIGNS  [dim]↑↓ navigate · Enter drill-down[/dim]", id="section-campaigns")
+        yield Static("CAMPAIGNS  [dim]↑↓ navigate · Enter drill-down · S simulate[/dim]", id="section-campaigns")
         yield DataTable(id="campaign-table")
         yield ScrollableContainer(
             Static("", id="alerts-content"),
@@ -572,6 +1084,14 @@ class BanditDBDashboard(App):
         if row_idx < len(rows):
             cid = rows[row_idx]["id"]
             self.push_screen(CampaignDetailScreen(self._db, cid))
+
+    def action_simulate(self) -> None:
+        rows = self._overview.get("campaigns", [])
+        tbl: DataTable = self.query_one("#campaign-table", DataTable)
+        row_idx = tbl.cursor_row
+        if row_idx < len(rows):
+            cid = rows[row_idx]["id"]
+            self.push_screen(SimulationScreen(self._db, cid))
 
     def _poll_overview(self, future) -> None:
         if future.done():
@@ -653,7 +1173,8 @@ class BanditDBDashboard(App):
             converged = row["converged"]
             leader    = row["leading_arm"]
 
-            algo_c = _algo_color(algo)
+            algo_c    = _algo_color(algo)
+            algo_str  = _algo_name(algo)
             ec, es = _entropy_style(e_status)
             cc, cs = _conv_style(converged)
             trend_color = {
@@ -665,7 +1186,7 @@ class BanditDBDashboard(App):
 
             tbl.add_row(
                 f"[bold]{cid}[/bold]",
-                f"[{algo_c}]{algo}[/{algo_c}]",
+                f"[{algo_c}]{algo_str}[/{algo_c}]",
                 str(arm_count),
                 _fmt_num(preds),
                 _fmt_num(rewards),
@@ -734,7 +1255,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    db  = Client(url=args.url, api_key=args.api_key)
+    # max_retries=0: fail fast — retrying timed-out calls floods the server with CLOSE_WAIT connections
+    db  = Client(url=args.url, api_key=args.api_key, max_retries=0)
     app = BanditDBDashboard(db=db, refresh_interval=args.refresh)
     app.run()
 

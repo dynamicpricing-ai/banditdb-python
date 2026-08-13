@@ -431,16 +431,27 @@ class Client:
 
     def report(self, campaign_id: str) -> dict:
         """
-        Get the business-level convergence report for a campaign.
+        Per-arm performance with confidence intervals, plus a ``converged`` flag.
 
-        The ``converged`` field answers "is this campaign done?":
+        ``converged`` tests for a **single globally best arm**:
           True   — leading arm has a statistically significant advantage at 95% CI.
-          False  — leading but CIs still overlap — keep collecting data.
+          False  — no single global winner yet.
           None   — not enough data yet (< 30 rewards per arm).
+
+        **It stays False on a healthy contextual campaign, by design.** Where
+        different arms win for different contexts — push notifications convert on
+        mobile, email on desktop — no arm is globally best, so the confidence
+        intervals overlap however well the model routes. A campaign operating at
+        its theoretical optimum still reports ``converged: False``.
+
+        Read it as "is there one winner for everybody?", not "has this learned?".
+        For a contextual campaign, judge learning by the reward-rate trend and by
+        whether traffic *splits* across arms — collapsing onto a single arm is the
+        signal that the model is not using the context.
 
         Compare ``arms[arm_id].traffic_share`` to the causal_forest() arm
         assignment percentages (Python SDK ``banditdb.eval.causal_analysis``)
-        to verify the bandit has converged to the causally correct structure.
+        to verify the bandit has found the causally correct structure.
 
         Returns
         -------
@@ -470,7 +481,10 @@ class Client:
             Change since the last checkpoint. ``"falling"`` indicates a recent event
             (pipeline bug, deploy, cohort shift). ``"unknown"`` until first checkpoint.
         converged : bool or None
-            Guard 1: True suppresses entropy alerts when one arm has statistically won.
+            Guard 1: True suppresses entropy alerts when one arm has statistically
+            won outright. Stays False on contextual campaigns where no arm is
+            globally best, even when the model is optimal — there, healthy
+            behaviour is high entropy with traffic split by context.
         likely_cause : str or None
             Present when ``entropy_status`` is ``"warning"`` or ``"critical"``.
             One of: ``"recent_collapse"``, ``"early_lock_in"``, ``"sustained_collapse"``.
