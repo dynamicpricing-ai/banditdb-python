@@ -1,0 +1,52 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.dynamicpricing-ai/banditdb",
+  "title": "BanditDB",
+  "description": "Persistent decision memory for agents — learns which action works in which context",
+  "repository": {
+    "url": "https://github.com/dynamicpricing-ai/banditdb-python",
+    "source": "github",
+    "id": "1168312867"
+  },
+  "version": "0.2.0",
+  "websiteUrl": "https://banditdb.com/docs/mcp/",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "banditdb-python",
+      "version": "0.2.0",
+      "runtimeHint": "uvx",
+      "runtimeArguments": [
+        {
+          "type": "named",
+          "name": "--from",
+          "value": "banditdb-python"
+        },
+        {
+          "type": "positional",
+          "value": "banditdb-mcp"
+        }
+      ],
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "BANDITDB_URL",
+          "description": "Base URL of the BanditDB server, e.g. http://localhost:8080 or https://your-instance.api.banditdb.com. Try it against the public sandbox at https://sandbox.banditdb.com before running your own.",
+          "isRequired": true,
+          "default": "http://localhost:8080",
+          "format": "string"
+        },
+        {
+          "name": "BANDITDB_API_KEY",
+          "description": "API key. A writer-role key is enough for get_intuition and record_outcome; admin is needed to create or delete campaigns.",
+          "isRequired": true,
+          "isSecret": true,
+          "format": "string"
+        }
+      ]
+    }
+  ]
+}

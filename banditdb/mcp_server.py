@@ -183,16 +183,24 @@ def campaign_diagnostics(campaign_id: str) -> str:
 @mcp.tool()
 def campaign_report(campaign_id: str) -> str:
     """
-    Get the business-level convergence report for a campaign.
+    Get per-arm performance for a campaign, with confidence intervals.
 
-    Use this to answer: "Is this campaign done? Which arm is winning?"
+    Use this to answer: "How is this campaign doing? Which arm leads, and by how much?"
 
-    The `converged` field is the key signal:
-      True  — the leading arm has a statistically significant advantage (95% CI).
-              You can safely stop the experiment and deploy the winner.
-      False — one arm leads but confidence intervals still overlap.
-              Keep collecting data.
+    The `converged` field tests whether ONE arm is best for EVERYBODY:
+      True  — the leading arm has a statistically significant global advantage
+              (95% CI). Safe to stop and deploy the winner.
+      False — no single global winner yet.
       None  — not enough data yet (< 30 rewards per arm).
+
+    IMPORTANT: on a contextual campaign, `converged` stays False by design. Where
+    different arms win for different contexts — one action for mobile users,
+    another for desktop — no arm is globally best, so the intervals overlap however
+    well the model routes. A campaign performing at its theoretical optimum still
+    reports False. Do NOT report `converged: False` to the user as "not learning".
+    Judge a contextual campaign by its reward rate over time and by traffic
+    splitting across arms; traffic collapsing onto a single arm is the sign the
+    model has stopped using the context.
 
     Also shows per-arm reward rates with confidence intervals, and for Progressive
     campaigns: challenger traffic percentage and win streak.
