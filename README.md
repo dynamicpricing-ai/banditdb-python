@@ -4,6 +4,11 @@ The official Python client and Model Context Protocol (MCP) server for **BanditD
 
 BanditDB abstracts away the complex linear algebra of Reinforcement Learning (LinUCB, Thompson Sampling) behind a dead-simple API. Build real-time personalizers, dynamic A/B tests, and give LLM agents mathematically rigorous persistent memory.
 
+<!-- Proves to the official MCP Registry that this PyPI package and the
+     `com.banditdb/mcp` server name belong to the same owner. The registry reads
+     this from the README rendered on PyPI, so it must ship in a release. -->
+mcp-name: com.banditdb/mcp
+
 ## Installation
 
 ```bash

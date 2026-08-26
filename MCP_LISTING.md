@@ -21,7 +21,35 @@ uv itself tells you to use `--from`. That is why `server.json` carries
 `runtimeArguments`; a listing generated from the package name alone would be
 broken for every user who copied it.
 
-## 1. Official MCP Registry — do this first
+## 1. Official MCP Registry — DONE
+
+Published 2026-08-26 as **`com.banditdb/mcp` 0.2.1**, domain-verified via a DNS
+TXT record on the `banditdb.com` apex. Live at
+`https://registry.modelcontextprotocol.io/v0/servers?search=banditdb`.
+
+The signing key lives at `~/.config/banditdb/mcp-registry-key.pem` (mode 600,
+deliberately outside the repo). It is needed for every future publish — losing it
+means re-doing the DNS challenge with a new key. The registry JWT expires quickly,
+so re-run the `login dns` step each time before publishing.
+
+Two things the registry required that are not obvious:
+
+- **PyPI ownership proof.** `mcp-name: com.banditdb/mcp` must appear in the
+  README *as rendered on PyPI*, so it only counts once shipped in a release.
+  That forced the 0.2.1 SDK release.
+- **Version agreement.** `server.json`'s `version` and `packages[0].version` must
+  match the released PyPI version.
+
+### Re-publishing a new version
+
+```bash
+cd /Users/simeon/Projects/banditdb-python
+PRIVATE_KEY="$(openssl pkey -in ~/.config/banditdb/mcp-registry-key.pem -noout -text | grep -A3 'priv:' | tail -n +2 | tr -d ' :\n')"
+mcp-publisher login dns --domain banditdb.com --private-key "$PRIVATE_KEY"
+mcp-publisher publish
+```
+
+## Original setup notes
 
 Directories consume this, so a clean record here improves the others.
 

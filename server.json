@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.dynamicpricing-ai/banditdb",
+  "name": "com.banditdb/mcp",
   "title": "BanditDB",
   "description": "Persistent decision memory for agents — learns which action works in which context",
   "repository": {
@@ -8,14 +8,14 @@
     "source": "github",
     "id": "1168312867"
   },
-  "version": "0.2.0",
+  "version": "0.2.1",
   "websiteUrl": "https://banditdb.com/docs/mcp/",
   "packages": [
     {
       "registryType": "pypi",
       "registryBaseUrl": "https://pypi.org",
       "identifier": "banditdb-python",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "runtimeHint": "uvx",
       "runtimeArguments": [
         {

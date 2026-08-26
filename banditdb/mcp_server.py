@@ -3,7 +3,13 @@ from mcp.server.fastmcp import FastMCP
 from banditdb import Client, BanditDBError
 
 # Initialize the MCP server
-mcp = FastMCP("BanditDB Intuition Engine")
+# FastMCP takes no `version` argument in mcp 1.x, so serverInfo reports the
+# library's version rather than ours. Cosmetic, and not worth breaking the server
+# over. `website_url` is supported and is what directories link to.
+mcp = FastMCP(
+    "BanditDB Intuition Engine",
+    website_url="https://banditdb.com/docs/mcp/",
+)
 
 # Connect to the BanditDB server.
 # Configure via environment variables:
