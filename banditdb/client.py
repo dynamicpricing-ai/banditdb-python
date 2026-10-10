@@ -201,10 +201,142 @@ Algorithm = Union[
     ProgressiveConfig,
 ]
 
+ArmStatus = Literal["active", "paused", "retired"]
+ARM_STATUSES: Tuple[str, ...] = ("active", "paused", "retired")
+
 def _serialise_algorithm(algo: Algorithm) -> Any:
     if isinstance(algo, str):
         return algo
     return algo._to_api()
+
+# ---------------------------------------------------------------------------
+# Budget constraints (Lagrangian pacing, server 2.3.0+)
+# ---------------------------------------------------------------------------
+
+def _check_number(value: Any, what: str, allow_zero: bool) -> None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{what} must be a number, got {type(value).__name__}")
+    if not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
+        bound = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{what} must be finite and {bound}, got {value}")
+
+
+def _validate_costs(costs: Dict[str, float], what: str) -> None:
+    for key, cost in costs.items():
+        _check_number(cost, f"{what}['{key}']", allow_zero=True)
+
+
+@dataclass
+class ResourceConstraint:
+    """
+    One budgeted resource in a pacing campaign: coupons, call-centre minutes,
+    ad spend — anything an arm consumes when it is chosen.
+
+    The server learns a shadow price per unit of this resource and subtracts
+    ``price × cost`` from each arm's score, so costly arms are chosen only where
+    their uplift is worth what they spend. An arm whose cost exceeds the remaining
+    budget is not selectable.
+
+    Parameters
+    ----------
+    name           : Resource name, unique within the campaign (e.g. "promo_budget").
+    budget         : Total amount available over the horizon. Must be > 0.
+    arm_costs      : Units consumed each time an arm is **predicted**, keyed by arm id.
+                     Arms left out cost 0. Every key must be one of the campaign's arms.
+    horizon        : Number of decisions the budget should last. Default 10,000.
+    step_size      : Shadow-price learning rate. Default: auto-tuned from the horizon
+                     (2 / √horizon).
+    lambda_max     : Upper bound on the shadow price. Default: auto-tuned.
+    initial_lambda : Starting shadow price. Default 0.0 (no penalty until spend
+                     outruns the target rate).
+    """
+    name:           str
+    budget:         float
+    arm_costs:      Dict[str, float] = field(default_factory=dict)
+    horizon:        int              = 10_000
+    step_size:      Optional[float]  = None
+    lambda_max:     Optional[float]  = None
+    initial_lambda: Optional[float]  = None
+
+    def _validate(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("resource name must be a non-empty string")
+        what = f"resource '{self.name}'"
+        _check_number(self.budget, f"{what} budget", allow_zero=False)
+        if not isinstance(self.horizon, int) or isinstance(self.horizon, bool) or self.horizon <= 0:
+            raise ValueError(f"{what} horizon must be a positive integer, got {self.horizon!r}")
+        if self.step_size is not None:
+            _check_number(self.step_size, f"{what} step_size", allow_zero=False)
+        if self.lambda_max is not None:
+            _check_number(self.lambda_max, f"{what} lambda_max", allow_zero=False)
+        if self.initial_lambda is not None:
+            _check_number(self.initial_lambda, f"{what} initial_lambda", allow_zero=True)
+        _validate_costs(self.arm_costs, f"{what} arm_costs")
+
+    def _to_api(self) -> dict:
+        out: dict = {
+            "name":      self.name,
+            "budget":    self.budget,
+            "horizon":   self.horizon,
+            "arm_costs": dict(self.arm_costs),
+        }
+        for key in ("step_size", "lambda_max", "initial_lambda"):
+            value = getattr(self, key)
+            if value is not None:
+                out[key] = value
+        return out
+
+
+@dataclass
+class PacingConfig:
+    """
+    Budget constraints for a campaign. Requires server 2.3.0+.
+
+    Parameters
+    ----------
+    resources : One ResourceConstraint per budgeted resource.
+    adaptive  : Target the remaining budget over the remaining decisions (True,
+                default) rather than a fixed budget / horizon rate. Adaptive pacing
+                recovers from early over- or under-spend.
+
+    Behaviours worth knowing before you rely on it:
+
+    - **Budget is spent at predict, not reward.** A recommendation you never act
+      on still consumes budget.
+    - **Budget never resets, and the config is immutable.** Once spent, costly arms
+      stay unselectable until the campaign is recreated.
+    - **Downgrading the server below 2.3.0 silently drops pacing** — older binaries
+      ignore the field and the campaign becomes unconstrained without error.
+    - Predicts on a pacing campaign return 503 when the server's WAL cannot take
+      the extra consumption record; unconstrained campaigns are unaffected.
+
+    Example::
+
+        PacingConfig(resources=[
+            ResourceConstraint(
+                name="promo_budget",
+                budget=5_000.0,
+                horizon=100_000,
+                arm_costs={"discount_10": 1.0, "discount_20": 2.0},
+            ),
+        ])
+    """
+    resources: List[ResourceConstraint]
+    adaptive:  bool = True
+
+    def _validate(self) -> None:
+        seen = set()
+        for r in self.resources:
+            r._validate()
+            if r.name in seen:
+                raise ValueError(f"duplicate resource name: '{r.name}'")
+            seen.add(r.name)
+
+    def _to_api(self) -> dict:
+        return {
+            "resources": [r._to_api() for r in self.resources],
+            "adaptive":  self.adaptive,
+        }
 
 # ---------------------------------------------------------------------------
 # Client
@@ -384,6 +516,7 @@ class Client:
         algorithm:            Algorithm      = "linucb",
         metadata:             Optional[dict] = None,
         decay_half_life_hours: Optional[float] = None,
+        pacing:               Optional[PacingConfig] = None,
     ) -> bool:
         """
         Create a new decision campaign.
@@ -402,9 +535,27 @@ class Client:
                                 is preserved — only certainty erodes, forcing re-exploration
                                 as evidence ages. None = no forgetting (default).
                                 Examples: 24.0 (daily drift), 168.0 (weekly), 720.0 (monthly).
+        pacing                : Budget constraints (PacingConfig). Server 2.3.0+. Fixed at
+                                creation — it cannot be changed or reset afterwards.
 
         Returns True on success. Raises APIError if the campaign already exists.
+
+        Raises
+        ------
+        ValueError : pacing is invalid, or an ``arm_costs`` key is not one of ``arms``.
+                     The server accepts unknown keys silently, which leaves a
+                     misspelt arm costing nothing — checked here instead.
         """
+        if pacing is not None:
+            pacing._validate()
+            known = set(arms)
+            for r in pacing.resources:
+                unknown = sorted(set(r.arm_costs) - known)
+                if unknown:
+                    raise ValueError(
+                        f"resource '{r.name}' arm_costs names unknown arms {unknown}; "
+                        f"campaign arms are {list(arms)}"
+                    )
         payload: dict = {
             "campaign_id": campaign_id,
             "arms":        arms,
@@ -416,6 +567,8 @@ class Client:
             payload["metadata"] = metadata
         if decay_half_life_hours is not None:
             payload["decay_half_life_hours"] = decay_half_life_hours
+        if pacing is not None:
+            payload["pacing"] = pacing._to_api()
         return self._post("/campaign", payload) == "Campaign Created"
 
     def list_campaigns(self) -> List[dict]:
@@ -425,6 +578,7 @@ class Client:
     def campaign_info(self, campaign_id: str) -> dict:
         """
         Return the full state for one campaign: per-arm theta vectors, reward counters, etc.
+        Pacing campaigns also carry a ``pacing`` key, shaped as pacing() returns.
         Raises APIError (404) if the campaign does not exist.
         """
         return self._get(f"/campaign/{campaign_id}")
@@ -500,6 +654,28 @@ class Client:
         """
         return self._get(f"/campaign/{campaign_id}/diagnostics")
 
+    def pacing(self, campaign_id: str) -> Optional[dict]:
+        """
+        Budget state of a pacing campaign, or None if it has no pacing. Server 2.3.0+.
+
+        Returns a dict with:
+            adaptive  : bool
+            resources : list of per-resource dicts —
+                name, budget, consumed, remaining, utilization (consumed / budget),
+                lambda (current shadow price), horizon, decisions, is_exhausted
+
+        ``lambda`` is what one unit of the resource currently costs an arm's score.
+        Rising means spend is running ahead of the target rate; 0 means the budget
+        is not binding. Once ``is_exhausted`` is True every arm with a cost for that
+        resource stays unselectable — budgets do not reset.
+
+        Example::
+
+            for r in db.pacing("promos")["resources"]:
+                print(f"{r['name']}: {r['utilization']:.0%} spent, λ={r['lambda']:.3f}")
+        """
+        return self._get(f"/campaign/{campaign_id}/pacing")
+
     def delete_campaign(self, campaign_id: str) -> bool:
         """Permanently delete a campaign. Returns True if deleted, False if not found."""
         return self._delete(f"/campaign/{campaign_id}")
@@ -517,9 +693,101 @@ class Client:
         self._post(f"/campaign/{campaign_id}/restore")
         return True
 
+    # -- Arms -------------------------------------------------------------------
+
+    def add_arm(
+        self,
+        campaign_id: str,
+        arm_id:      str,
+        group:       Optional[str]              = None,
+        warm_start:  Optional[dict]             = None,
+        costs:       Optional[Dict[str, float]] = None,
+    ) -> bool:
+        """
+        Add an arm to a live campaign. Requires an admin key.
+
+        Parameters
+        ----------
+        campaign_id : Campaign to extend. Must not be archived.
+        arm_id      : New arm's id. Must not already exist.
+        group       : Hierarchy label. Arms sharing a group can lend their estimate to
+                      new members via ``warm_start={"from": "group"}``.
+        warm_start  : Prior for the new arm. Default: cold start. One of
+                      ``{"from": "population", "strength": 1.0}``,
+                      ``{"from": "group", "strength": 1.0}``,
+                      ``{"from": "arms", "arms": [...], "strength": 1.0}``.
+        costs       : Pacing campaigns only (server 2.3.0+). Units of each resource the
+                      arm consumes per prediction, keyed by resource name. Resources
+                      left out cost 0. The server rejects unknown resource names and
+                      costs on a campaign without pacing.
+
+        Returns True on success. Raises APIError if the arm exists, the campaign is
+        archived, or a cost names an unknown resource.
+
+        Raises
+        ------
+        ValueError : a cost is negative or non-finite.
+
+        Example::
+
+            db.add_arm("promos", "discount_30", costs={"promo_budget": 3.0})
+        """
+        body: dict = {"arm_id": arm_id}
+        if group is not None:
+            body["group"] = group
+        if warm_start is not None:
+            body["warm_start"] = warm_start
+        if costs is not None:
+            _validate_costs(costs, "costs")
+            body["costs"] = costs
+        return self._post(f"/campaign/{campaign_id}/arms", body) == "Arm Added"
+
+    def set_arm_status(
+        self,
+        campaign_id: str,
+        arm_id:      str,
+        status:      ArmStatus,
+    ) -> bool:
+        """
+        Pause, retire, or reactivate an arm. Requires an admin key.
+
+        Parameters
+        ----------
+        campaign_id : Campaign the arm belongs to.
+        arm_id      : Arm to change.
+        status      : ``"active"``  — selectable (the default for every arm).
+                      ``"paused"``  — not selectable, keeps learning from in-flight
+                                      rewards. Reversible; meant for "out of stock",
+                                      "creative paused", "seasonal".
+                      ``"retired"`` — not selectable, still absorbs in-flight rewards.
+                                      Meant as permanent, but nothing is deleted and
+                                      it can be set back to ``"active"``.
+
+        The arm keeps everything it learned in every state. To narrow the candidates
+        for a single request without changing state, pass ``eligible_arms`` /
+        ``exclude_arms`` to predict() instead.
+
+        Returns True on success. Raises APIError if the campaign or arm does not exist.
+
+        Raises
+        ------
+        ValueError : status is not one of the three values above.
+        """
+        if status not in ARM_STATUSES:
+            raise ValueError(f"status must be one of {list(ARM_STATUSES)}, got {status!r}")
+        return self._post(
+            f"/campaign/{campaign_id}/arms/{arm_id}/status", {"status": status}
+        ) == "Arm Status Updated"
+
     # -- Predict / Reward -------------------------------------------------------
 
-    def predict(self, campaign_id: str, context: List[float]) -> Tuple[str, str]:
+    def predict(
+        self,
+        campaign_id:   str,
+        context:       List[float],
+        eligible_arms: Optional[List[str]] = None,
+        exclude_arms:  Optional[List[str]] = None,
+    ) -> Tuple[str, str]:
         """
         Select the best arm for the given context.
 
@@ -532,6 +800,12 @@ class Client:
         context     : Feature vector. Length must match the campaign's feature_dim.
                       Values must be finite and within ±1e6. Normalise to unit L2
                       norm — see normalize_context() for why it matters.
+        eligible_arms : Restrict this request to these arms. None = every active arm.
+        exclude_arms  : Drop these arms from this request, applied after
+                        ``eligible_arms``. Use for per-request constraints — out of
+                        stock for this shopper, already shown to this user. Neither
+                        filter changes campaign state; see set_arm_status() for that.
+                        If nothing is left to choose from, the server returns an error.
 
         Returns
         -------
@@ -543,7 +817,12 @@ class Client:
                      you get the offending index rather than a 400 from the server.
         """
         _validate_context(context)
-        data = self._post("/predict", {"campaign_id": campaign_id, "context": context})
+        body: dict = {"campaign_id": campaign_id, "context": context}
+        if eligible_arms is not None:
+            body["eligible_arms"] = eligible_arms
+        if exclude_arms is not None:
+            body["exclude_arms"] = exclude_arms
+        data = self._post("/predict", body)
         return data["arm_id"], data["interaction_id"]
 
     def batch_predict(
@@ -556,6 +835,7 @@ class Client:
         Each item in `predictions` must have keys:
             campaign_id : str
             context     : List[float]
+        and may have ``eligible_arms`` / ``exclude_arms``, as in predict().
 
         Returns a list of result dicts. Each dict has either:
             arm_id, interaction_id  — on success

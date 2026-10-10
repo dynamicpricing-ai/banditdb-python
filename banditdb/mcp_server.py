@@ -1,6 +1,6 @@
 import os
 from mcp.server.fastmcp import FastMCP
-from banditdb import Client, BanditDBError
+from banditdb import Client, BanditDBError, PacingConfig, ResourceConstraint
 
 # Initialize the MCP server
 # FastMCP takes no `version` argument in mcp 1.x, so serverInfo reports the
@@ -28,6 +28,7 @@ def create_campaign(
     alpha: float = 1.0,
     algorithm: str = "linucb",
     decay_half_life_hours: float | None = None,
+    budgets: list[dict] | None = None,
 ) -> str:
     """
     Create a new decision campaign in BanditDB.
@@ -59,26 +60,54 @@ def create_campaign(
                    24.0 for fast-changing contexts (daily drift),
                    168.0 for weekly drift (good default for agentic memory),
                    720.0 for slow monthly drift.
+        budgets: Optional budget constraints, for when some actions cost something
+                   limited (discount spend, human-agent minutes, paid API calls).
+                   One dict per resource:
+                     {"name": "promo_budget", "budget": 5000, "horizon": 100000,
+                      "arm_costs": {"discount_10": 1.0, "discount_20": 2.0}}
+                   `budget` is the total available over `horizon` decisions
+                   (default 10000). `arm_costs` is what each arm consumes per
+                   suggestion; arms left out are free and every key must be one of
+                   `arms`. BanditDB then spreads spend over the horizon, picking
+                   costly arms only where they are worth it. Budget is spent when
+                   get_intuition suggests an arm, never resets, and cannot be changed
+                   after creation. Requires BanditDB server 2.3.0+.
 
     Returns:
         Confirmation that the campaign was created, or an error message.
     """
     try:
+        pacing = None
+        if budgets:
+            pacing = PacingConfig(resources=[
+                ResourceConstraint(
+                    name=b["name"],
+                    budget=b["budget"],
+                    horizon=b.get("horizon", 10_000),
+                    arm_costs=b.get("arm_costs", {}),
+                )
+                for b in budgets
+            ])
         db.create_campaign(
             campaign_id, arms, feature_dim,
             alpha=alpha, algorithm=algorithm,
             decay_half_life_hours=decay_half_life_hours,
+            pacing=pacing,
         )
         decay_note = (
             f", decay_half_life={decay_half_life_hours}h"
             if decay_half_life_hours is not None else ""
         )
+        if pacing is not None:
+            decay_note += f", budgets={[r.name for r in pacing.resources]}"
         return (
             f"✅ Campaign '{campaign_id}' created with {len(arms)} arms: {arms}. "
             f"feature_dim={feature_dim}, alpha={alpha}, algorithm={algorithm}{decay_note}. "
             f"You can now call get_intuition('{campaign_id}', context) with a "
             f"context vector of {feature_dim} floats."
         )
+    except KeyError as e:
+        return f"Invalid input: each budget needs 'name' and 'budget' (missing {e})"
     except ValueError as e:
         return f"Invalid input: {str(e)}"
     except BanditDBError as e:
@@ -350,7 +379,118 @@ def restore_campaign(campaign_id: str) -> str:
 
 
 @mcp.tool()
-def get_intuition(campaign_id: str, context: list[float]) -> str:
+def campaign_budget(campaign_id: str) -> str:
+    """
+    Show how a budget-constrained campaign is spending its budgets.
+
+    Use this to answer: "How much budget is left? Is spend on pace? Why does the
+    campaign stop suggesting the expensive option?"
+
+    Per resource it reports budget, consumed, remaining, utilization, and the
+    shadow price (lambda): what one unit of the resource currently costs an
+    action's score. Rising lambda means spend is running ahead of pace; 0 means the
+    budget is not limiting anything. Once a resource is exhausted, every action that
+    costs it stays unavailable for good — budgets do not reset.
+
+    Args:
+        campaign_id: The campaign to inspect.
+
+    Returns:
+        A per-resource budget summary, or a note that the campaign has no budgets.
+    """
+    try:
+        p = db.pacing(campaign_id)
+        if p is None:
+            return f"Campaign '{campaign_id}' has no budget constraints."
+        lines = [
+            f"Campaign: {campaign_id} "
+            f"({'adaptive' if p.get('adaptive') else 'uniform'} pacing)",
+            "",
+            "Budgets:",
+        ]
+        for r in p.get("resources", []):
+            lines.append(
+                f"  • {r['name']}: {r['consumed']:g} / {r['budget']:g} spent "
+                f"({r['utilization']:.0%}), remaining={r['remaining']:g}, "
+                f"lambda={r['lambda']:.4f}, decisions={r['decisions']}/{r['horizon']}"
+                + ("  ⚠ EXHAUSTED" if r.get("is_exhausted") else "")
+            )
+        return "\n".join(lines)
+    except ValueError as e:
+        return f"Invalid input: {str(e)}"
+    except BanditDBError as e:
+        return f"Error fetching campaign budget: {str(e)}"
+
+
+@mcp.tool()
+def add_arm(
+    campaign_id: str,
+    arm_id: str,
+    group: str | None = None,
+    warm_start_from: str | None = None,
+    costs: dict[str, float] | None = None,
+) -> str:
+    """
+    Add a new action (arm) to an existing campaign without losing what it has learned.
+
+    Args:
+        campaign_id: The campaign to extend.
+        arm_id: Name of the new action. Must not already exist.
+        group: Optional category label (e.g. 'shoes'). Arms in the same group can
+               lend their knowledge to a new member.
+        warm_start_from: Optional. "population" starts the new arm from the average
+               of all active arms; "group" from the average of its group. Default is
+               a cold start that learns from scratch.
+        costs: Budget campaigns only. What the new action consumes per suggestion,
+               keyed by budget name, e.g. {"promo_budget": 3.0}. Omitted = free.
+
+    Returns:
+        Confirmation or error message.
+    """
+    try:
+        warm_start = {"from": warm_start_from} if warm_start_from else None
+        db.add_arm(campaign_id, arm_id, group=group, warm_start=warm_start, costs=costs)
+        return f"Arm '{arm_id}' added to campaign '{campaign_id}'."
+    except ValueError as e:
+        return f"Invalid input: {str(e)}"
+    except BanditDBError as e:
+        return f"Error adding arm: {str(e)}"
+
+
+@mcp.tool()
+def set_arm_status(campaign_id: str, arm_id: str, status: str) -> str:
+    """
+    Pause, retire, or reactivate an action (arm) in a campaign.
+
+    Use "paused" for temporary unavailability (out of stock, seasonal), "retired" for
+    actions that should not come back, and "active" to restore either. The arm keeps
+    everything it learned in every state. To skip an arm for one request only, pass
+    exclude_arms to get_intuition instead.
+
+    Args:
+        campaign_id: The campaign the arm belongs to.
+        arm_id: The arm to change.
+        status: "active", "paused", or "retired".
+
+    Returns:
+        Confirmation or error message.
+    """
+    try:
+        db.set_arm_status(campaign_id, arm_id, status)
+        return f"Arm '{arm_id}' in campaign '{campaign_id}' is now {status}."
+    except ValueError as e:
+        return f"Invalid input: {str(e)}"
+    except BanditDBError as e:
+        return f"Error setting arm status: {str(e)}"
+
+
+@mcp.tool()
+def get_intuition(
+    campaign_id: str,
+    context: list[float],
+    exclude_arms: list[str] | None = None,
+    eligible_arms: list[str] | None = None,
+) -> str:
     """
     Ask the BanditDB Hive Mind for the best strategy or action to take.
 
@@ -359,12 +499,18 @@ def get_intuition(campaign_id: str, context: list[float]) -> str:
         context: A list of finite floats representing the current state (e.g., user
             sentiment, task difficulty). Keep values on a similar, modest scale —
             roughly -1 to 1 works well. Very large values are rejected.
+        exclude_arms: Optional. Actions not allowed for this request only (e.g.
+            already tried, unavailable right now). Does not change the campaign.
+        eligible_arms: Optional. Choose only among these actions for this request.
 
     Returns:
         A string telling you which action to take, and the interaction_id you MUST save for the reward.
     """
     try:
-        arm_id, interaction_id = db.predict(campaign_id, context)
+        arm_id, interaction_id = db.predict(
+            campaign_id, context,
+            eligible_arms=eligible_arms, exclude_arms=exclude_arms,
+        )
         return (
             f"💡 BanditDB Suggests: Take action '{arm_id}'.\n"
             f"[IMPORTANT] Save this interaction_id for the outcome: {interaction_id}"

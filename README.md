@@ -69,7 +69,7 @@ except BanditDBError as e:
 
 | Method | Description |
 |--------|-------------|
-| `create_campaign(campaign_id, arms, feature_dim, alpha=1.0, algorithm="linucb", metadata=None)` | Register a new campaign. `algorithm` accepts `"linucb"`, `"thompson_sampling"`, `NeuralLinUCBConfig`, or `ProgressiveConfig`. `metadata` is an arbitrary JSON dict (≤ 64 KB). |
+| `create_campaign(campaign_id, arms, feature_dim, alpha=1.0, algorithm="linucb", metadata=None, decay_half_life_hours=None, pacing=None)` | Register a new campaign. `algorithm` accepts `"linucb"`, `"thompson_sampling"`, `NeuralLinUCBConfig`, or `ProgressiveConfig`. `metadata` is an arbitrary JSON dict (≤ 64 KB). `pacing` takes a `PacingConfig` — see [Budget constraints](#budget-constraints). |
 | `list_campaigns()` | Returns a list of all campaigns (active and archived) with `alpha`, `arm_count`, and `algorithm`. |
 | `campaign_info(campaign_id)` | Returns full per-arm state: `theta`, `theta_norm`, prediction and reward counters. Raises `APIError` (404) if not found. |
 | `report(campaign_id)` | Business-level convergence report. `converged=True` means one arm has a statistically significant lead at 95% CI — safe to stop. `converged=False` means leading but CIs still overlap. `converged=None` means not enough data yet (< 30 rewards per arm). |
@@ -77,12 +77,15 @@ except BanditDBError as e:
 | `archive_campaign(campaign_id)` | Soft-delete: pauses predictions/rewards but preserves all learned weights. Recoverable with `restore_campaign()`. |
 | `restore_campaign(campaign_id)` | Restore an archived campaign to active status with all weights intact. |
 | `delete_campaign(campaign_id)` | Permanently delete a campaign. Returns `False` if not found. |
+| `pacing(campaign_id)` | Budget state of a pacing campaign: per-resource `budget`, `consumed`, `remaining`, `utilization`, `lambda` (shadow price), `is_exhausted`. `None` if the campaign has no pacing. Server 2.3.0+. |
+| `add_arm(campaign_id, arm_id, group=None, warm_start=None, costs=None)` | Add an arm to a live campaign (admin key). `costs` maps resource name → units consumed per prediction, for pacing campaigns. |
+| `set_arm_status(campaign_id, arm_id, status)` | `"active"`, `"paused"` (not selectable, reversible) or `"retired"`. The arm keeps what it learned. Admin key. |
 
 **Predict & Reward**
 
 | Method | Description |
 |--------|-------------|
-| `predict(campaign_id, context)` | Returns `(arm_id, interaction_id)`. Pass `interaction_id` to `reward()` to close the loop. |
+| `predict(campaign_id, context, eligible_arms=None, exclude_arms=None)` | Returns `(arm_id, interaction_id)`. Pass `interaction_id` to `reward()` to close the loop. The optional filters narrow candidates for this call only. |
 | `batch_predict(predictions)` | Predict for up to 100 campaign/context pairs in a single round-trip. Each item: `{"campaign_id": str, "context": List[float]}`. Returns list of `{arm_id, interaction_id}` or `{error}` per item. |
 | `reward(interaction_id, reward)` | Record outcome. `reward` must be in `[0.0, 1.0]`. Raises `APIError` if the interaction has already been rewarded or has expired (default TTL: 24 h). |
 
@@ -92,6 +95,42 @@ except BanditDBError as e:
 |--------|-------------|
 | `checkpoint()` | Flush WAL, snapshot models, write Parquet shards, run neural retrain + tournament eval, rotate WAL. Returns a summary string. |
 | `export()` | List Parquet export shards grouped by campaign. Returns `{export_dir, shards}`. |
+
+### Budget constraints
+
+Server 2.3.0+. Give a campaign one or more budgeted resources and per-arm costs; the
+server learns a shadow price per resource and steers spend to last the horizon,
+choosing costly arms only where their uplift is worth it.
+
+```python
+from banditdb import Client, PacingConfig, ResourceConstraint
+
+db.create_campaign(
+    "promos", ["none", "discount_10", "discount_20"], feature_dim=4,
+    pacing=PacingConfig(resources=[
+        ResourceConstraint(
+            name="promo_budget",
+            budget=5_000.0,      # units available over the horizon
+            horizon=100_000,     # decisions the budget should last
+            arm_costs={"discount_10": 1.0, "discount_20": 2.0},  # "none" costs 0
+        ),
+    ]),
+)
+
+# Arms added later declare their own costs
+db.add_arm("promos", "discount_30", costs={"promo_budget": 3.0})
+
+for r in db.pacing("promos")["resources"]:
+    print(f"{r['name']}: {r['utilization']:.0%} spent, lambda={r['lambda']:.3f}")
+```
+
+Worth knowing:
+
+- **Budget is spent at `predict`, not `reward`.** A recommendation you never act on still consumes budget.
+- **Budget never resets and pacing is immutable.** Once spent, costly arms stay unselectable until the campaign is recreated.
+- `arm_costs` keys must be campaign arms. The server would silently treat a misspelt arm as free; the SDK raises `ValueError` instead.
+- Predicts on a pacing campaign can return 503 if the server's WAL is saturated.
+- Downgrading the server below 2.3.0 silently drops pacing.
 
 ---
 
@@ -131,19 +170,22 @@ Add to your Claude configuration file:
 }
 ```
 
-The agent swarm now has nine tools:
+The agent swarm now has twelve tools:
 
 | Tool | What it does |
 |------|--------------|
-| `create_campaign` | Create a new decision campaign. Accepts `algorithm` (`"linucb"` or `"thompson_sampling"`) and `alpha`. Use Thompson Sampling for natural Bayesian exploration with no tuning needed. |
+| `create_campaign` | Create a new decision campaign. Accepts `algorithm` (`"linucb"` or `"thompson_sampling"`), `alpha`, and optional `budgets` for actions that cost something limited. Use Thompson Sampling for natural Bayesian exploration with no tuning needed. |
 | `list_campaigns` | List all active campaigns (shows `algorithm` and `alpha`) — useful to check what exists before calling `get_intuition`. |
 | `campaign_diagnostics` | Inspect per-arm learning state: `theta_norm`, prediction counts, reward rates, and entropy health. Use when a campaign doesn't seem to be learning or one arm is dominating. |
 | `campaign_report` | Business-level convergence report. Tells you whether the campaign has statistically converged and which arm is winning with confidence intervals. |
-| `get_intuition` | Ask BanditDB which arm to pick for a given context. Returns the arm and an `interaction_id` to save. |
+| `get_intuition` | Ask BanditDB which arm to pick for a given context. Optional `exclude_arms` / `eligible_arms` narrow the choice for this request only. Returns the arm and an `interaction_id` to save. |
 | `batch_get_intuition` | Get decisions for multiple campaigns in a single round-trip. Pass a list of `{campaign_id, context}` dicts. |
 | `record_outcome` | Report whether the chosen action succeeded (1.0) or failed (0.0). Updates the shared model. |
 | `archive_campaign` | Soft-delete a campaign. Pauses predictions/rewards but preserves all learned weights. |
 | `restore_campaign` | Restore an archived campaign to active status with all weights intact. |
+| `campaign_budget` | Budget spend per resource: consumed, remaining, utilization, shadow price, exhaustion. |
+| `add_arm` | Add an action to a live campaign, optionally warm-started from existing arms and with budget costs. |
+| `set_arm_status` | Pause, retire, or reactivate an action. It keeps everything it learned. |
 
 Every decision made by any agent in the network improves the routing for all future agents.
 

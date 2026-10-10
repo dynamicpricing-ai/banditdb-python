@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.0 — Budget constraints and arm lifecycle (server 2.3.0)
+
+### Added
+
+- **Budget constraints (Lagrangian pacing).** `create_campaign(..., pacing=PacingConfig(...))`
+  attaches one or more `ResourceConstraint`s — `name`, `budget`, `horizon`, per-arm
+  `arm_costs`, and optional `step_size` / `lambda_max` / `initial_lambda` tuning.
+  Requires server 2.3.0+; older servers ignore the field and the campaign runs
+  unconstrained.
+- **`pacing(campaign_id)`** — budget, consumption, remaining, utilization, shadow
+  price and exhaustion per resource. `None` for campaigns without pacing.
+  `campaign_info()` also carries this under `pacing`.
+- **`add_arm(campaign_id, arm_id, group=None, warm_start=None, costs=None)`** — the
+  server's add-arm endpoint was never exposed by the SDK. `costs` sets the new arm's
+  per-resource cost on a pacing campaign.
+- Local validation mirrors the server (positive finite budgets, positive horizon,
+  non-negative costs, unique resource names) and goes one further: `arm_costs` keys
+  that are not campaign arms raise `ValueError`. The server accepts them silently,
+  leaving the misspelt arm free.
+- **`set_arm_status(campaign_id, arm_id, status)`** — pause, retire, or reactivate
+  an arm (`"active"` / `"paused"` / `"retired"`). Exported `ArmStatus` type.
+- **`predict(..., eligible_arms=None, exclude_arms=None)`** — per-request candidate
+  filters, for constraints that change per call (out of stock for this shopper,
+  already shown). `batch_predict` items accept the same keys.
+- **MCP server: three new tools and two extended ones.** `campaign_budget`,
+  `add_arm`, `set_arm_status` are new; `create_campaign` takes `budgets` and
+  `get_intuition` takes `exclude_arms` / `eligible_arms`. Twelve tools in total.
+
 ## 0.2.0 — BanditDB server 2.0.0 compatibility
 
 **Requires server 2.0.0+.** Against older servers, `health_detail()` raises a clear

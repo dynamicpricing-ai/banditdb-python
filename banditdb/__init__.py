@@ -3,12 +3,15 @@ from .client import (
     NeuralLinUCBConfig,
     ProgressiveConfig,
     Algorithm,
+    ArmStatus,
+    PacingConfig,
+    ResourceConstraint,
     normalize_context,
     MAX_CONTEXT_MAGNITUDE,
 )
 from .exceptions import BanditDBError, ConnectionError, TimeoutError, APIError
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 
 def __getattr__(name):
@@ -48,6 +51,10 @@ __all__ = [
     "NeuralLinUCBConfig",
     "ProgressiveConfig",
     "Algorithm",
+    "ArmStatus",
+    # Budget constraints
+    "PacingConfig",
+    "ResourceConstraint",
     # Context helpers
     "normalize_context",
     "MAX_CONTEXT_MAGNITUDE",

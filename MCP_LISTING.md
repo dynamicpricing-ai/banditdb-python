@@ -9,9 +9,11 @@ Run against PyPI `banditdb-python` 0.2.0, not asserted from memory:
 
 - `uvx --from banditdb-python banditdb-mcp` starts the server and completes an
   MCP `initialize` handshake (protocol `2024-11-05`).
-- `tools/list` returns **9 tools**: `create_campaign`, `list_campaigns`,
-  `campaign_diagnostics`, `campaign_report`, `batch_get_intuition`,
-  `archive_campaign`, `restore_campaign`, `get_intuition`, `record_outcome`.
+- `tools/list` returns **12 tools** as of 0.3.0: `create_campaign`,
+  `list_campaigns`, `campaign_diagnostics`, `campaign_report`,
+  `batch_get_intuition`, `archive_campaign`, `restore_campaign`,
+  `campaign_budget`, `add_arm`, `set_arm_status`, `get_intuition`,
+  `record_outcome`. (0.2.x shipped the first nine.)
 - `server.json` validates against
   `https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json`.
 
