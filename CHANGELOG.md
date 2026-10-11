@@ -2,6 +2,10 @@
 
 ## 0.3.0 — Budget constraints and arm lifecycle (server 2.3.0)
 
+### Fixed
+
+- The terminal dashboard coloured `thompson_sampling` campaigns as unknown.
+
 ### Added
 
 - **Budget constraints (Lagrangian pacing).** `create_campaign(..., pacing=PacingConfig(...))`
@@ -24,6 +28,10 @@
 - **`predict(..., eligible_arms=None, exclude_arms=None)`** — per-request candidate
   filters, for constraints that change per call (out of stock for this shopper,
   already shown). `batch_predict` items accept the same keys.
+- **`NeuralTSConfig`** — NeuralTS, the server's `neural_thompson_sampling`
+  algorithm (Zhang et al., ICLR 2021) had no SDK support at all. Same parameters as
+  `NeuralLinUCBConfig`, but posterior-sampling exploration scaled by `alpha`.
+  Usable directly or as a Progressive `base` / `challenger`.
 - **MCP server: three new tools and two extended ones.** `campaign_budget`,
   `add_arm`, `set_arm_status` are new; `create_campaign` takes `budgets` and
   `get_intuition` takes `exclude_arms` / `eligible_arms`. Twelve tools in total.

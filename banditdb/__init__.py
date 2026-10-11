@@ -1,6 +1,7 @@
 from .client import (
     Client,
     NeuralLinUCBConfig,
+    NeuralTSConfig,
     ProgressiveConfig,
     Algorithm,
     ArmStatus,
@@ -49,6 +50,7 @@ __all__ = [
     "Client",
     # Algorithm configs
     "NeuralLinUCBConfig",
+    "NeuralTSConfig",
     "ProgressiveConfig",
     "Algorithm",
     "ArmStatus",

@@ -132,3 +132,40 @@ class TestClientGuardsBeforeSending:
         with pytest.raises(ValueError):
             client.interact("c", "A", [float("nan")], 1.0)
         client.session.post.assert_not_called()
+
+
+class TestNeuralTS:
+    """The server's ``neural_thompson_sampling`` takes the same config as NeuralLinUCB."""
+
+    def test_serialises_under_its_own_key(self):
+        from banditdb import NeuralTSConfig
+
+        api = NeuralTSConfig(context_dim=8, embed_dim=16, lambda_reg=0.5)._to_api()
+        assert list(api) == ["neural_thompson_sampling"]
+        assert api["neural_thompson_sampling"]["context_dim"] == 8
+        assert api["neural_thompson_sampling"]["embed_dim"] == 16
+        assert api["neural_thompson_sampling"]["lambda"] == 0.5
+
+    def test_neural_linucb_unchanged(self):
+        from banditdb import NeuralLinUCBConfig
+
+        assert list(NeuralLinUCBConfig(context_dim=8)._to_api()) == ["neural_lin_ucb"]
+
+    def test_create_campaign_sends_it(self, client):
+        from banditdb import NeuralTSConfig
+        from tests.conftest import make_response
+
+        client.session.post.return_value = make_response(200, "Campaign Created")
+        client.create_campaign(
+            "c", ["a", "b"], 8, algorithm=NeuralTSConfig(context_dim=8)
+        )
+        algo = client.session.post.call_args.kwargs["json"]["algorithm"]
+        assert "neural_thompson_sampling" in algo
+
+    def test_works_as_progressive_challenger(self):
+        from banditdb import NeuralTSConfig, ProgressiveConfig
+
+        api = ProgressiveConfig(
+            base="linucb", challenger=NeuralTSConfig(context_dim=4)
+        )._to_api()
+        assert "neural_thompson_sampling" in api["progressive"]["challenger"]

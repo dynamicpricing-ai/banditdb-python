@@ -57,7 +57,9 @@ def _algo_color(algo) -> str:
     colors = {
         "linucb":         "#60A5FA",
         "thompson":       "#A78BFA",
+        "thompson_sampling": "#A78BFA",
         "neural_lin_ucb": "#F472B6",
+        "neural_thompson_sampling": "#F472B6",
         "neural":         "#F472B6",
         "progressive":    "#FB923C",
         "tournament":     "#FB923C",

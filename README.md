@@ -69,7 +69,7 @@ except BanditDBError as e:
 
 | Method | Description |
 |--------|-------------|
-| `create_campaign(campaign_id, arms, feature_dim, alpha=1.0, algorithm="linucb", metadata=None, decay_half_life_hours=None, pacing=None)` | Register a new campaign. `algorithm` accepts `"linucb"`, `"thompson_sampling"`, `NeuralLinUCBConfig`, or `ProgressiveConfig`. `metadata` is an arbitrary JSON dict (≤ 64 KB). `pacing` takes a `PacingConfig` — see [Budget constraints](#budget-constraints). |
+| `create_campaign(campaign_id, arms, feature_dim, alpha=1.0, algorithm="linucb", metadata=None, decay_half_life_hours=None, pacing=None)` | Register a new campaign. `algorithm` accepts `"linucb"`, `"thompson_sampling"`, `NeuralLinUCBConfig`, `NeuralTSConfig`, or `ProgressiveConfig`. `metadata` is an arbitrary JSON dict (≤ 64 KB). `pacing` takes a `PacingConfig` — see [Budget constraints](#budget-constraints). |
 | `list_campaigns()` | Returns a list of all campaigns (active and archived) with `alpha`, `arm_count`, and `algorithm`. |
 | `campaign_info(campaign_id)` | Returns full per-arm state: `theta`, `theta_norm`, prediction and reward counters. Raises `APIError` (404) if not found. |
 | `report(campaign_id)` | Business-level convergence report. `converged=True` means one arm has a statistically significant lead at 95% CI — safe to stop. `converged=False` means leading but CIs still overlap. `converged=None` means not enough data yet (< 30 rewards per arm). |
@@ -268,17 +268,18 @@ print("Observed (logging policy):", df["reward"].mean())
 
 ## Choosing an Algorithm
 
-BanditDB supports four algorithms, selected at campaign creation time.
+BanditDB supports five algorithms, selected at campaign creation time.
 
 | Algorithm | `algorithm` value | Exploration style | When to use |
 |-----------|------------------|-------------------|-------------|
 | **LinUCB** | `"linucb"` (default) | Deterministic UCB bonus: `θ·x + α√(x·A⁻¹·x)` | Predictable, tunable. Sweep `alpha` offline to calibrate. |
 | **Linear Thompson Sampling** | `"thompson_sampling"` | Samples θ̃ ~ N(θ, α²·A⁻¹), scores by θ̃·x | Bayesian posterior — no alpha-sweep needed. Concurrent users automatically diversify choices. |
 | **NeuralLinUCB** | `NeuralLinUCBConfig(...)` | Deep MLP embedding + LinUCB in embedding space | Non-linear reward functions. Retrains the MLP every N rewards. |
+| **NeuralTS** | `NeuralTSConfig(...)` | Same MLP embedding as NeuralLinUCB; scores by a posterior draw in embedding space instead of a UCB bound | Non-linear rewards where long-run performance matters more than early regret. Converges further at 20K+ interactions. |
 | **Progressive** | `ProgressiveConfig(...)` | Self-tuning tournament: runs base + challenger in parallel, shifts traffic to the winner | Zero-configuration model selection. Picks the best algorithm automatically. |
 
 ```python
-from banditdb import Client, NeuralLinUCBConfig, ProgressiveConfig
+from banditdb import Client, NeuralLinUCBConfig, NeuralTSConfig, ProgressiveConfig
 
 db = Client("http://localhost:8080")
 
@@ -298,6 +299,10 @@ cfg = NeuralLinUCBConfig(
 )
 db.create_campaign("routing_neural", ["fast", "cheap"], feature_dim=4, algorithm=cfg)
 
+# NeuralTS — same parameters as NeuralLinUCB, posterior-sampling exploration
+cfg = NeuralTSConfig(context_dim=4, embed_dim=32)
+db.create_campaign("routing_nts", ["fast", "cheap"], feature_dim=4, algorithm=cfg)
+
 # Progressive — runs LinUCB vs NeuralLinUCB, shifts traffic to whoever wins SNIPS checkpoints
 cfg = ProgressiveConfig(
     base="linucb",
@@ -309,7 +314,19 @@ cfg = ProgressiveConfig(
 db.create_campaign("routing_prog", ["fast", "cheap"], feature_dim=4, algorithm=cfg)
 ```
 
-All four algorithms share the same `predict` → `reward` loop.
+All five algorithms share the same `predict` → `reward` loop. Either neural config also works as a Progressive `base` or `challenger`.
+
+**NeuralLinUCB vs NeuralTS**
+
+| | NeuralLinUCB | NeuralTS |
+|---|---|---|
+| Exploration | UCB upper bound (deterministic) | Posterior sample (stochastic), spread scaled by `alpha` |
+| Early regret | Lower | Higher |
+| Convergence at 20K+ interactions | Slower | Faster |
+| Best for | Production safety, costly early mistakes | Maximum long-run performance |
+| Paper | Xu, Wen, Zhao & Gu, ICLR 2022 ([arXiv:2012.01780](https://arxiv.org/abs/2012.01780)) | Zhang, Zhou, Li & Gu, ICLR 2021 ([arXiv:2010.00827](https://arxiv.org/abs/2010.00827)) |
+
+Both neural algorithms need a server built with the `neural` feature: check `"neural" in db.server_info()["features"]`.
 
 ---
 

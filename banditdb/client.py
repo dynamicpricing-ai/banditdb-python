@@ -2,7 +2,7 @@
 banditdb.client — Synchronous Python client for BanditDB.
 
 Quickstart:
-    from banditdb import Client, NeuralLinUCBConfig, ProgressiveConfig
+    from banditdb import Client, NeuralLinUCBConfig, NeuralTSConfig, ProgressiveConfig
 
     db = Client("http://localhost:8080", api_key="...")
 
@@ -15,6 +15,10 @@ Quickstart:
     # Neural contextual bandit
     cfg = NeuralLinUCBConfig(context_dim=5, embed_dim=32)
     db.create_campaign("prices_neural", ["10", "15", "20"], feature_dim=5, algorithm=cfg)
+
+    # NeuralTS: same config, posterior-sampling exploration
+    cfg = NeuralTSConfig(context_dim=5, embed_dim=32)
+    db.create_campaign("prices_nts", ["10", "15", "20"], feature_dim=5, algorithm=cfg)
 
     # Self-tuning tournament (LinUCB vs NeuralLinUCB)
     cfg = ProgressiveConfig(
@@ -136,9 +140,11 @@ class NeuralLinUCBConfig:
     learning_rate: float = 1e-3
     lambda_reg:    float = 1.0
 
+    _API_KEY = "neural_lin_ucb"
+
     def _to_api(self) -> dict:
         return {
-            "neural_lin_ucb": {
+            self._API_KEY: {
                 "context_dim":   self.context_dim,
                 "embed_dim":     self.embed_dim,
                 "hidden_dim":    self.hidden_dim,
@@ -149,6 +155,32 @@ class NeuralLinUCBConfig:
                 "lambda":        self.lambda_reg,
             }
         }
+
+
+@dataclass
+class NeuralTSConfig(NeuralLinUCBConfig):
+    """
+    Configuration for NeuralTS, Neural Thompson Sampling (Zhang et al., ICLR 2021).
+
+    Same MLP embedding and retrain procedure as NeuralLinUCB — the parameters are
+    identical — but each arm is scored by a posterior draw ``w ~ N(θ, α²A⁻¹)`` in
+    the embedding space instead of an upper confidence bound. ``alpha`` on
+    create_campaign() scales the spread of that draw.
+
+    Stochastic exploration costs more regret early on and converges further over
+    long runs (20K+ interactions). Prefer NeuralLinUCBConfig when early mistakes are
+    expensive; prefer this when long-run performance matters more. Like the other
+    neural algorithms it needs a server built with the ``neural`` feature — check
+    ``server_info()["features"]``.
+
+    Parameters: see NeuralLinUCBConfig.
+
+    Example::
+
+        cfg = NeuralTSConfig(context_dim=128, embed_dim=16)
+        db.create_campaign("churn", arms, feature_dim=128, algorithm=cfg)
+    """
+    _API_KEY = "neural_thompson_sampling"
 
 
 @dataclass
@@ -165,7 +197,8 @@ class ProgressiveConfig:
 
     Parameters
     ----------
-    base          : Base algorithm. "linucb", "thompson_sampling", or NeuralLinUCBConfig.
+    base          : Base algorithm. "linucb", "thompson_sampling", NeuralLinUCBConfig,
+                    or NeuralTSConfig.
     challenger    : Challenger algorithm. Same options.
     min_obs       : Minimum buffer entries per arm before any traffic shift fires. Default 100.
     required_wins : Consecutive checkpoint wins required to earn one traffic step. Default 3.
@@ -198,6 +231,7 @@ class ProgressiveConfig:
 Algorithm = Union[
     Literal["linucb", "thompson_sampling"],
     NeuralLinUCBConfig,
+    NeuralTSConfig,
     ProgressiveConfig,
 ]
 
@@ -455,7 +489,7 @@ class Client:
 
             info = db.server_info()
             if "neural" not in info.get("features", []):
-                print("server cannot run NeuralLinUCB campaigns")
+                print("server cannot run neural campaigns")
         """
         try:
             r = self.session.get(f"{self.url}/health", timeout=self.timeout)
@@ -526,9 +560,12 @@ class Client:
         campaign_id           : Unique identifier. ASCII alphanumeric, hyphens, and underscores only.
         arms                  : Decision options (e.g. ["gpt-4o", "claude-haiku", "llama-3"]).
         feature_dim           : Length of the context vector you will pass to predict().
-                                For NeuralLinUCBConfig this is context_dim, not embed_dim.
-        alpha                 : Exploration / exploitation trade-off (LinUCB and TS). Default 1.0.
-        algorithm             : "linucb" | "thompson_sampling" | NeuralLinUCBConfig | ProgressiveConfig.
+                                For the neural configs this is context_dim, not embed_dim.
+        alpha                 : Exploration / exploitation trade-off. Scales the UCB bonus for
+                                LinUCB variants and the posterior spread for Thompson
+                                Sampling variants. Default 1.0.
+        algorithm             : "linucb" | "thompson_sampling" | NeuralLinUCBConfig |
+                                NeuralTSConfig | ProgressiveConfig.
         metadata              : Arbitrary JSON dict stored with the campaign (≤ 64 KB).
         decay_half_life_hours : Exponential forgetting. Confidence halves every N hours of
                                 real time, measured at each checkpoint. Theta (best estimate)
@@ -622,7 +659,7 @@ class Client:
 
         Includes per-arm theta norms, A_inv diagonal bounds (uncertainty proxy),
         tournament traffic percentage and win streak (Progressive campaigns),
-        neural replay buffer size (NeuralLinUCB campaigns), and entropy alerting fields.
+        neural replay buffer size (neural campaigns), and entropy alerting fields.
 
         Entropy alerting fields
         -----------------------
