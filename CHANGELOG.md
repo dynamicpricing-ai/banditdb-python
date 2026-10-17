@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0 — Named features
+
+### Added
+
+- **`create_campaign(..., features=[...])`** — name the features instead of giving
+  `feature_dim`. The campaign gets `feature_dim = len(features) + 1` and stores
+  `features` and `context: {"bias": true, "normalize": true}` in its metadata.
+- **Dict contexts** in `predict`, `batch_predict` and `interact`:
+  `db.predict("c", {"age": 0.34, "is_mobile": 1.0})`. The SDK orders the values,
+  appends the constant 1 and normalises — the `build_context` function every
+  integration used to write. Missing or unknown names raise `ValueError` naming
+  them, where a vector in the wrong order used to train silently on the wrong
+  features. The order is read once per campaign from `campaign_info()` and cached.
+  Campaigns created in the BanditDB console work without change.
+- `Context` and `NamedContext` type aliases.
+
+### Changed
+
+- `feature_dim` is now optional (still the third positional argument); one of
+  `features` or `feature_dim` is required. Lists still work everywhere.
+
 ## 0.3.1 — NeuralTS
 
 ### Added

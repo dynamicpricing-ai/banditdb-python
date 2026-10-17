@@ -40,13 +40,18 @@ try:
     db.create_campaign(
         campaign_id="checkout_upsell",
         arms=["offer_discount", "offer_free_shipping"],
-        feature_dim=3,
+        features=["is_mobile", "cart_value", "is_returning_user"],
     )
     # or: db.create_campaign(..., algorithm="thompson_sampling")
 
-    # 2. A user arrives — ask the database what to show them
-    # Context: [is_mobile, cart_value_normalized, is_returning_user]
-    arm_id, interaction_id = db.predict("checkout_upsell", [1.0, 0.8, 0.0])
+    # 2. A user arrives — ask the database what to show them.
+    # Scale each value to 0–1; the SDK puts them in order, adds a constant 1
+    # and normalises the vector.
+    arm_id, interaction_id = db.predict("checkout_upsell", {
+        "is_mobile": 1.0,
+        "cart_value": min(cart_total / 200, 1.0),
+        "is_returning_user": 0.0,
+    })
     print(f"Showing: {arm_id}")  # e.g., "offer_free_shipping"
 
     # 3. The user clicked — send the reward
@@ -55,6 +60,14 @@ try:
 except BanditDBError as e:
     print(f"Database error: {e}")
 ```
+
+**Named features or a vector.** With `features=[...]` the campaign stores the
+feature order in its metadata, and `predict`, `batch_predict` and `interact` accept
+a dict keyed by name. A missing or misspelt name raises `ValueError` before any
+request is sent. Campaigns created in the BanditDB console accept dicts too. The
+order is read once per campaign with `campaign_info()` and cached on the client.
+To manage the vector yourself, pass `feature_dim` instead and send lists —
+`normalize_context()` scales one to unit length.
 
 ### All Client methods
 
@@ -69,7 +82,7 @@ except BanditDBError as e:
 
 | Method | Description |
 |--------|-------------|
-| `create_campaign(campaign_id, arms, feature_dim, alpha=1.0, algorithm="linucb", metadata=None, decay_half_life_hours=None, pacing=None)` | Register a new campaign. `algorithm` accepts `"linucb"`, `"thompson_sampling"`, `NeuralLinUCBConfig`, `NeuralTSConfig`, or `ProgressiveConfig`. `metadata` is an arbitrary JSON dict (≤ 64 KB). `pacing` takes a `PacingConfig` — see [Budget constraints](#budget-constraints). |
+| `create_campaign(campaign_id, arms, feature_dim=None, alpha=1.0, algorithm="linucb", metadata=None, decay_half_life_hours=None, pacing=None, features=None)` | Register a new campaign. Pass `features` (names, in order) to predict with dicts, or `feature_dim` to send vectors. `algorithm` accepts `"linucb"`, `"thompson_sampling"`, `NeuralLinUCBConfig`, `NeuralTSConfig`, or `ProgressiveConfig`. `metadata` is an arbitrary JSON dict (≤ 64 KB). `pacing` takes a `PacingConfig` — see [Budget constraints](#budget-constraints). |
 | `list_campaigns()` | Returns a list of all campaigns (active and archived) with `alpha`, `arm_count`, and `algorithm`. |
 | `campaign_info(campaign_id)` | Returns full per-arm state: `theta`, `theta_norm`, prediction and reward counters. Raises `APIError` (404) if not found. |
 | `report(campaign_id)` | Business-level convergence report. `converged=True` means one arm has a statistically significant lead at 95% CI — safe to stop. `converged=False` means leading but CIs still overlap. `converged=None` means not enough data yet (< 30 rewards per arm). |
@@ -85,8 +98,8 @@ except BanditDBError as e:
 
 | Method | Description |
 |--------|-------------|
-| `predict(campaign_id, context, eligible_arms=None, exclude_arms=None)` | Returns `(arm_id, interaction_id)`. Pass `interaction_id` to `reward()` to close the loop. The optional filters narrow candidates for this call only. |
-| `batch_predict(predictions)` | Predict for up to 100 campaign/context pairs in a single round-trip. Each item: `{"campaign_id": str, "context": List[float]}`. Returns list of `{arm_id, interaction_id}` or `{error}` per item. |
+| `predict(campaign_id, context, eligible_arms=None, exclude_arms=None)` | `context` is a dict of feature values (named campaigns) or a vector. Returns `(arm_id, interaction_id)`. Pass `interaction_id` to `reward()` to close the loop. The optional filters narrow candidates for this call only. |
+| `batch_predict(predictions)` | Predict for up to 100 campaign/context pairs in a single round-trip. Each item: `{"campaign_id": str, "context": dict | List[float]}`. Returns list of `{arm_id, interaction_id}` or `{error}` per item. |
 | `reward(interaction_id, reward)` | Record outcome. `reward` must be in `[0.0, 1.0]`. Raises `APIError` if the interaction has already been rewarded or has expired (default TTL: 24 h). |
 
 **Data & Export**

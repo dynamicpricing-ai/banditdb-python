@@ -104,6 +104,89 @@ def _validate_reward(reward: float) -> None:
             "Rescale your outcome, e.g. revenue / max_revenue."
         )
 
+
+# A context passed by feature name rather than by position.
+NamedContext = Dict[str, float]
+Context = Union[List[float], NamedContext]
+
+
+@dataclass(frozen=True)
+class _ContextLayout:
+    """
+    How a campaign turns named feature values into the vector the engine holds.
+
+    Read from the campaign's metadata: ``features`` is the order, ``context``
+    says whether a constant 1 follows them and whether the vector is scaled to
+    unit length.
+    """
+    campaign_id: str
+    features:    Tuple[str, ...]
+    bias:        bool
+    normalize:   bool
+
+    def vector(self, values: NamedContext) -> List[float]:
+        missing = [f for f in self.features if f not in values]
+        unknown = sorted(set(values) - set(self.features))
+        if missing or unknown:
+            parts = []
+            if missing:
+                parts.append(f"missing {missing}")
+            if unknown:
+                parts.append(f"unknown {unknown}")
+            raise ValueError(
+                f"context for '{self.campaign_id}': {', '.join(parts)}; "
+                f"the campaign's features are {list(self.features)}"
+            )
+        out: List[float] = []
+        for name in self.features:
+            v = values[name]
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise ValueError(
+                    f"context['{name}'] must be a number, got {type(v).__name__}"
+                )
+            if not math.isfinite(v):
+                raise ValueError(f"context['{name}'] is {v}; it must be finite")
+            out.append(float(v))
+        if self.bias:
+            out.append(1.0)
+        return normalize_context(out) if self.normalize else out
+
+
+def _validate_features(features: List[str]) -> None:
+    if not features:
+        raise ValueError("features must not be empty")
+    for i, f in enumerate(features):
+        if not isinstance(f, str) or not f:
+            raise ValueError(f"features[{i}] must be a non-empty string")
+    seen: set = set()
+    dupes = sorted({f for f in features if f in seen or seen.add(f)})
+    if dupes:
+        raise ValueError(f"features are listed more than once: {dupes}")
+
+
+def _layout_from_info(campaign_id: str, info: dict) -> _ContextLayout:
+    """Read a campaign's context layout from what ``GET /campaign/{id}`` returns."""
+    meta = info.get("metadata") or {}
+    features = meta.get("features") if isinstance(meta, dict) else None
+    if not isinstance(features, list) or not features \
+            or not all(isinstance(f, str) for f in features):
+        raise ValueError(
+            f"campaign '{campaign_id}' has no feature names, so its context must be a "
+            "list of numbers. Campaigns created with create_campaign(..., features=[...]) "
+            "or from the BanditDB console accept a dict."
+        )
+    spec = meta.get("context")
+    if isinstance(spec, dict):
+        bias = bool(spec.get("bias", True))
+        normalize = bool(spec.get("normalize", True))
+    else:
+        # Written before the layout was recorded. The console has always
+        # normalised; the constant 1 came later, so tell from the width.
+        widths = {len(a.get("theta") or []) for a in (info.get("arms") or {}).values()}
+        bias = widths != {len(features)}
+        normalize = True
+    return _ContextLayout(campaign_id, tuple(features), bias, normalize)
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -410,7 +493,23 @@ class Client:
         if api_key:
             self.session.headers.update({"X-Api-Key": api_key})
 
+        # Feature order per campaign, fetched on the first named context.
+        self._layouts: Dict[str, _ContextLayout] = {}
+
     # -- Internal helpers -------------------------------------------------------
+
+    def _layout(self, campaign_id: str) -> _ContextLayout:
+        layout = self._layouts.get(campaign_id)
+        if layout is None:
+            layout = _layout_from_info(campaign_id, self.campaign_info(campaign_id))
+            self._layouts[campaign_id] = layout
+        return layout
+
+    def _vector(self, campaign_id: str, context: Context) -> List[float]:
+        """A dict becomes the campaign's vector; a list passes through as given."""
+        if isinstance(context, dict):
+            return self._layout(campaign_id).vector(context)
+        return context
 
     def _get(self, path: str) -> dict:
         try:
@@ -545,21 +644,34 @@ class Client:
         self,
         campaign_id:          str,
         arms:                 List[str],
-        feature_dim:          int,
+        feature_dim:          Optional[int]  = None,
         alpha:                float          = 1.0,
         algorithm:            Algorithm      = "linucb",
         metadata:             Optional[dict] = None,
         decay_half_life_hours: Optional[float] = None,
         pacing:               Optional[PacingConfig] = None,
+        features:             Optional[List[str]] = None,
     ) -> bool:
         """
         Create a new decision campaign.
+
+        Name the features and predict() takes a dict instead of a vector::
+
+            db.create_campaign("offers", ["a", "b"], features=["age", "is_mobile"])
+            arm, iid = db.predict("offers", {"age": 0.34, "is_mobile": 1.0})
+
+        The SDK puts the values in this order, appends a constant 1 (so the
+        model can learn each arm's base rate) and scales the vector to unit
+        length. feature_dim is then ``len(features) + 1`` and can be left out.
 
         Parameters
         ----------
         campaign_id           : Unique identifier. ASCII alphanumeric, hyphens, and underscores only.
         arms                  : Decision options (e.g. ["gpt-4o", "claude-haiku", "llama-3"]).
+        features              : Feature names, in the order the vector holds them. Stored
+                                in metadata as ``features`` and ``context``.
         feature_dim           : Length of the context vector you will pass to predict().
+                                Required unless ``features`` is given.
                                 For the neural configs this is context_dim, not embed_dim.
         alpha                 : Exploration / exploitation trade-off. Scales the UCB bonus for
                                 LinUCB variants and the posterior spread for Thompson
@@ -582,7 +694,30 @@ class Client:
         ValueError : pacing is invalid, or an ``arm_costs`` key is not one of ``arms``.
                      The server accepts unknown keys silently, which leaves a
                      misspelt arm costing nothing — checked here instead.
+                     Also: neither ``features`` nor ``feature_dim`` given, or they
+                     disagree, or ``features`` is empty or repeats a name.
         """
+        layout: Optional[_ContextLayout] = None
+        if features is not None:
+            _validate_features(features)
+            layout = _ContextLayout(campaign_id, tuple(features), bias=True, normalize=True)
+            width = len(features) + 1
+            if feature_dim is not None and feature_dim != width:
+                raise ValueError(
+                    f"feature_dim={feature_dim} but {len(features)} features need "
+                    f"{width} (one each plus a constant 1); leave feature_dim out"
+                )
+            feature_dim = width
+            stored = (metadata or {}).get("features")
+            if stored is not None and stored != list(features):
+                raise ValueError("metadata['features'] disagrees with features; pass one")
+            metadata = {
+                **(metadata or {}),
+                "features": list(features),
+                "context": {"bias": True, "normalize": True},
+            }
+        elif feature_dim is None:
+            raise ValueError("pass features=[...] or feature_dim")
         if pacing is not None:
             pacing._validate()
             known = set(arms)
@@ -606,7 +741,12 @@ class Client:
             payload["decay_half_life_hours"] = decay_half_life_hours
         if pacing is not None:
             payload["pacing"] = pacing._to_api()
-        return self._post("/campaign", payload) == "Campaign Created"
+        created = self._post("/campaign", payload) == "Campaign Created"
+        if layout is not None:
+            self._layouts[campaign_id] = layout
+        else:
+            self._layouts.pop(campaign_id, None)
+        return created
 
     def list_campaigns(self) -> List[dict]:
         """Return a list of campaign summary dicts (id, alpha, arm_count, archived, algorithm)."""
@@ -715,6 +855,7 @@ class Client:
 
     def delete_campaign(self, campaign_id: str) -> bool:
         """Permanently delete a campaign. Returns True if deleted, False if not found."""
+        self._layouts.pop(campaign_id, None)
         return self._delete(f"/campaign/{campaign_id}")
 
     def archive_campaign(self, campaign_id: str) -> bool:
@@ -821,7 +962,7 @@ class Client:
     def predict(
         self,
         campaign_id:   str,
-        context:       List[float],
+        context:       Context,
         eligible_arms: Optional[List[str]] = None,
         exclude_arms:  Optional[List[str]] = None,
     ) -> Tuple[str, str]:
@@ -834,9 +975,15 @@ class Client:
         Parameters
         ----------
         campaign_id : Which campaign to query.
-        context     : Feature vector. Length must match the campaign's feature_dim.
-                      Values must be finite and within ±1e6. Normalise to unit L2
-                      norm — see normalize_context() for why it matters.
+        context     : A dict of feature name → value, for campaigns whose features
+                      are named (``create_campaign(..., features=[...])`` or the
+                      console). Scale each value to 0–1; the SDK orders them, adds
+                      the constant 1 and normalises. The feature names are read
+                      once per campaign with campaign_info() and cached.
+
+                      Or the vector itself: length must match the campaign's
+                      feature_dim, values finite and within ±1e6. Normalise to unit
+                      L2 norm — see normalize_context() for why it matters.
         eligible_arms : Restrict this request to these arms. None = every active arm.
         exclude_arms  : Drop these arms from this request, applied after
                         ``eligible_arms``. Use for per-request constraints — out of
@@ -852,7 +999,10 @@ class Client:
         ------
         ValueError : context is empty, non-finite, or too large. Checked locally so
                      you get the offending index rather than a 400 from the server.
+                     For a dict: a feature is missing or unknown, or the campaign
+                     has no feature names.
         """
+        context = self._vector(campaign_id, context)
         _validate_context(context)
         body: dict = {"campaign_id": campaign_id, "context": context}
         if eligible_arms is not None:
@@ -871,7 +1021,7 @@ class Client:
 
         Each item in `predictions` must have keys:
             campaign_id : str
-            context     : List[float]
+            context     : List[float], or a dict of feature values as in predict()
         and may have ``eligible_arms`` / ``exclude_arms``, as in predict().
 
         Returns a list of result dicts. Each dict has either:
@@ -894,14 +1044,17 @@ class Client:
                      whole batch is checked before sending, so one bad item does not
                      consume a round trip.
         """
+        items = []
         for i, item in enumerate(predictions):
             if "campaign_id" not in item or "context" not in item:
                 raise ValueError(f"predictions[{i}] needs both 'campaign_id' and 'context'")
             try:
-                _validate_context(item["context"])
+                context = self._vector(item["campaign_id"], item["context"])
+                _validate_context(context)
             except ValueError as e:
                 raise ValueError(f"predictions[{i}]: {e}") from None
-        return self._post("/batch_predict", {"predictions": predictions})
+            items.append({**item, "context": context})
+        return self._post("/batch_predict", {"predictions": items})
 
     def reward(self, interaction_id: str, reward: float) -> bool:
         """
@@ -933,7 +1086,7 @@ class Client:
         self,
         campaign_id: str,
         arm_id: str,
-        context: List[float],
+        context: Context,
         reward: float,
     ) -> str:
         """
@@ -947,7 +1100,7 @@ class Client:
         ----------
         campaign_id : Must already exist.
         arm_id      : The arm that was actually shown.
-        context     : Feature vector, same constraints as predict().
+        context     : Feature vector or dict of feature values, as in predict().
         reward      : Observed outcome in [0.0, 1.0].
 
         Returns the interaction_id assigned to the backfilled record.
@@ -957,6 +1110,7 @@ class Client:
             for row in historical_log:
                 db.interact("prices", row.variant, row.features, row.converted)
         """
+        context = self._vector(campaign_id, context)
         _validate_context(context)
         _validate_reward(reward)
         data = self._post(

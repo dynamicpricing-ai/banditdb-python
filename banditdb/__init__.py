@@ -9,10 +9,12 @@ from .client import (
     ResourceConstraint,
     normalize_context,
     MAX_CONTEXT_MAGNITUDE,
+    Context,
+    NamedContext,
 )
 from .exceptions import BanditDBError, ConnectionError, TimeoutError, APIError
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 
 def __getattr__(name):
@@ -60,6 +62,8 @@ __all__ = [
     # Context helpers
     "normalize_context",
     "MAX_CONTEXT_MAGNITUDE",
+    "Context",
+    "NamedContext",
     # Exceptions
     "BanditDBError",
     "ConnectionError",
