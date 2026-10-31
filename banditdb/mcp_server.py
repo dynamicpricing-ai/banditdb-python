@@ -191,7 +191,8 @@ def campaign_diagnostics(campaign_id: str) -> str:
 
         lines += ["", "Arms:"]
         for arm_id, arm in sorted(d["arm_stats"].items()):
-            reward_rate = (
+            # Outcomes recorded per decision, not the reward rate.
+            recorded = (
                 f"{arm['rewards'] / arm['predictions']:.0%}"
                 if arm["predictions"] > 0
                 else "n/a"
@@ -199,7 +200,7 @@ def campaign_diagnostics(campaign_id: str) -> str:
             lines.append(
                 f"  • {arm_id}: theta_norm={arm['theta_norm']:.4f}, "
                 f"predictions={arm['predictions']}, "
-                f"rewards={arm['rewards']} ({reward_rate})"
+                f"outcomes={arm['rewards']} ({recorded} recorded)"
             )
 
         if d.get("challenger_traffic_pct") is not None:
@@ -258,12 +259,17 @@ def campaign_report(campaign_id: str) -> str:
             "Arms:",
         ]
         for arm_id, arm in r.get("arms", {}).items():
-            ci_lo = arm.get("ci_lower", 0)
-            ci_hi = arm.get("ci_upper", 0)
+            # The engine reports mean_reward with a 95% CI once an arm has 10 outcomes; None before.
+            mean = arm.get("mean_reward")
+            rate = (
+                "n/a (under 10 outcomes)"
+                if mean is None
+                else f"{mean:.1%} [{arm.get('reward_lower_ci') or 0:.1%}, {arm.get('reward_upper_ci') or 0:.1%}]"
+            )
             lines.append(
-                f"  • {arm_id}: reward_rate={arm.get('reward_rate', 0):.1%} "
-                f"[{ci_lo:.3f}, {ci_hi:.3f}]  "
+                f"  • {arm_id}: reward_rate={rate}  "
                 f"predictions={arm.get('predictions', 0)}  "
+                f"outcomes={arm.get('rewards', 0)}  "
                 f"traffic={arm.get('traffic_share', 0):.1%}"
             )
         if r.get("challenger_traffic_pct") is not None:
